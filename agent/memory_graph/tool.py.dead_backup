@@ -1,0 +1,319 @@
+"""Memory Graph tools — 9 MCP tool functions for URI-tree memory operations.
+
+Tools: memory_graph_read, memory_graph_create, memory_graph_update,
+       memory_graph_delete, memory_graph_list, memory_graph_search,
+       memory_graph_alias, memory_graph_glossary_add, memory_graph_glossary_scan
+"""
+
+import asyncio
+import logging
+from typing import Optional, Dict, Any, List
+
+logger = logging.getLogger(__name__)
+
+_graph_service = None
+_search_indexer = None
+_glossary_service = None
+
+
+def _get_graph():
+    global _graph_service
+    if _graph_service is None:
+        from agent.memory_graph.services.graph import GraphService
+        _graph_service = GraphService()
+    return _graph_service
+
+
+def _get_search():
+    global _search_indexer
+    if _search_indexer is None:
+        from agent.memory_graph.services.search import SearchIndexer
+        _search_indexer = SearchIndexer()
+    return _search_indexer
+
+
+def _get_glossary():
+    global _glossary_service
+    if _glossary_service is None:
+        from agent.memory_graph.services.glossary import GlossaryService
+        _glossary_service = GlossaryService()
+    return _glossary_service
+
+
+def _run_async(coro):
+    """Run async coroutine from sync context."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=60)
+    return asyncio.run(coro)
+
+
+# ─── Tool Handlers ─────────────────────────────────────────────────
+
+def memory_graph_read(uri: str, domain: str = "core") -> str:
+    """Read a memory by URI (domain://path)."""
+    import json
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        path = uri
+    # system:// URIs
+    if domain == "system":
+        from agent.memory_graph.services.system_views import handle_system_uri
+        result = _run_async(handle_system_uri(path, _get_graph(), _get_search()))
+        return json.dumps(result, ensure_ascii=False, default=str)
+    result = _run_async(_get_graph().get_memory_by_path(path, domain=domain))
+    if result is None:
+        return json.dumps({"error": f"Not found: {domain}://{path}"})
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def memory_graph_create(parent_uri: str, content: str, title: str = "",
+                         priority: int = 0, domain: str = "core") -> str:
+    """Create a new memory under a parent URI."""
+    import json
+    if "://" in parent_uri:
+        domain, parent_path = parent_uri.split("://", 1)
+    else:
+        parent_path = parent_uri
+    result = _run_async(_get_graph().create_memory(
+        parent_path, content, priority=priority,
+        title=title or None, domain=domain
+    ))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def memory_graph_update(uri: str, content: str, domain: str = "core",
+                         priority: Optional[int] = None) -> str:
+    """Update a memory's content (creates new version)."""
+    import json
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        path = uri
+    result = _run_async(_get_graph().update_memory(
+        path, content, domain=domain, priority=priority
+    ))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def memory_graph_delete(uri: str, domain: str = "core") -> str:
+    """Delete a memory and its subtree."""
+    import json
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        path = uri
+    result = _run_async(_get_graph().delete_memory(path, domain=domain))
+    return json.dumps({"deleted": result, "uri": f"{domain}://{path}"})
+
+
+def memory_graph_list(uri: str = "", domain: str = "core") -> str:
+    """List children of a URI (or root if empty)."""
+    import json
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        path = uri
+    if path:
+        node = _run_async(_get_graph().get_memory_by_path(path, domain=domain))
+        if not node:
+            return json.dumps({"error": f"Not found: {domain}://{path}"})
+        node_uuid = node["node_uuid"]
+    else:
+        from agent.memory_graph.db.models import ROOT_NODE_UUID
+        node_uuid = ROOT_NODE_UUID
+    children = _run_async(_get_graph().get_children(node_uuid, domain=domain))
+    return json.dumps({"parent": f"{domain}://{path}" if path else "(root)", "children": children},
+                       ensure_ascii=False, default=str)
+
+
+def memory_graph_search(query: str, domain: str = "", limit: int = 20) -> str:
+    """Search across all memory content."""
+    import json
+    results = _run_async(_get_search().search(query, domain=domain or None, limit=limit))
+    return json.dumps({"query": query, "results": results, "count": len(results)},
+                       ensure_ascii=False, default=str)
+
+
+def memory_graph_alias(uri: str, alias_uri: str, domain: str = "core") -> str:
+    """Add an alias path pointing to an existing memory."""
+    import json
+    if "://" in uri:
+        domain, path = uri.split("://", 1)
+    else:
+        path = uri
+    alias_domain = domain
+    if "://" in alias_uri:
+        alias_domain, alias_path = alias_uri.split("://", 1)
+    else:
+        alias_path = alias_uri
+    result = _run_async(_get_graph().add_alias(
+        path, alias_path, domain=domain, alias_domain=alias_domain
+    ))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def memory_graph_glossary_add(keyword: str, node_uri: str, domain: str = "core") -> str:
+    """Bind a keyword to a node for trigger scanning."""
+    import json
+    if "://" in node_uri:
+        domain, path = node_uri.split("://", 1)
+    else:
+        path = node_uri
+    node = _run_async(_get_graph().get_memory_by_path(path, domain=domain))
+    if not node:
+        return json.dumps({"error": f"Node not found: {domain}://{path}"})
+    result = _run_async(_get_glossary().add_keyword(keyword, node["node_uuid"]))
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def memory_graph_glossary_scan(content: str) -> str:
+    """Scan content for glossary keywords."""
+    import json
+    matches = _run_async(_get_glossary().scan_content(content))
+    return json.dumps({"matches": matches, "count": len(matches)},
+                       ensure_ascii=False, default=str)
+
+
+def memory_graph_recall(limit: int = 5) -> str:
+    """Weighted random recall — surface forgotten-but-important memories."""
+    import json
+    results = _run_async(_get_graph().weighted_random_recall(limit=limit))
+    return json.dumps({"recalled": results, "count": len(results)},
+                       ensure_ascii=False, default=str)
+
+
+# ─── Tool Schema Definitions ───────────────────────────────────────
+
+MEMORY_GRAPH_TOOLS = [
+    {
+        "name": "memory_graph_read",
+        "description": "Read a memory by URI (domain://path). Returns content, metadata, aliases.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "URI like core://path/to/memory"},
+                "domain": {"type": "string", "default": "core"},
+            },
+            "required": ["uri"],
+        },
+    },
+    {
+        "name": "memory_graph_create",
+        "description": "Create a new memory node under a parent URI.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "parent_uri": {"type": "string", "description": "Parent URI (empty = root)"},
+                "content": {"type": "string", "description": "Memory content"},
+                "title": {"type": "string", "default": ""},
+                "priority": {"type": "integer", "default": 0},
+                "domain": {"type": "string", "default": "core"},
+            },
+            "required": ["parent_uri", "content"],
+        },
+    },
+    {
+        "name": "memory_graph_update",
+        "description": "Update a memory's content (creates new version, deprecates old).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string"},
+                "content": {"type": "string"},
+                "domain": {"type": "string", "default": "core"},
+                "priority": {"type": "integer"},
+            },
+            "required": ["uri", "content"],
+        },
+    },
+    {
+        "name": "memory_graph_delete",
+        "description": "Delete a memory node and its entire subtree.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string"},
+                "domain": {"type": "string", "default": "core"},
+            },
+            "required": ["uri"],
+        },
+    },
+    {
+        "name": "memory_graph_list",
+        "description": "List children of a URI (or root if empty).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "default": ""},
+                "domain": {"type": "string", "default": "core"},
+            },
+        },
+    },
+    {
+        "name": "memory_graph_search",
+        "description": "Full-text search across all memory content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "domain": {"type": "string", "default": ""},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_graph_alias",
+        "description": "Add an alias path pointing to an existing memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "Existing URI"},
+                "alias_uri": {"type": "string", "description": "New alias URI"},
+                "domain": {"type": "string", "default": "core"},
+            },
+            "required": ["uri", "alias_uri"],
+        },
+    },
+    {
+        "name": "memory_graph_glossary_add",
+        "description": "Bind a keyword to a node for trigger scanning.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string"},
+                "node_uri": {"type": "string"},
+                "domain": {"type": "string", "default": "core"},
+            },
+            "required": ["keyword", "node_uri"],
+        },
+    },
+    {
+        "name": "memory_graph_glossary_scan",
+        "description": "Scan content for glossary keywords and return matching nodes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "memory_graph_recall",
+        "description": "Weighted random recall — surface forgotten-but-important memories based on staleness and priority.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 5, "description": "Number of memories to recall"},
+            },
+        },
+    },
+]
