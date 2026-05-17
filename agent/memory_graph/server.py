@@ -345,7 +345,12 @@ def create_app(graph_service=None, search_indexer=None, glossary_service=None):
     @app.post("/api/memory-graph/glossary/scan")
     async def api_glossary_scan(request: Request):
         user = require_auth(request)
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, 'Invalid or empty JSON body')
+        if not body or "content" not in body:
+            raise HTTPException(422, 'Missing required field: content')
         matches = await glossary_service.scan_content(body["content"])
         from .db import get_session
         from .db.models import Path, Memory
