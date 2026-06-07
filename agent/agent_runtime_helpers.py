@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
@@ -47,20 +46,6 @@ def _ra():
     import run_agent
     return run_agent
 
-
-AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "delegate_task"}
-)
-
-
-def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
-    """Return True when an agent-level tool path emits its own post hook."""
-    if function_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES:
-        return True
-    if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
-        return True
-    memory_manager = getattr(agent, "_memory_manager", None)
-    return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
@@ -1622,34 +1607,25 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
-                 tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None) -> str:
+                 tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
-    if not isinstance(function_args, dict):
-        function_args = {}
-
-    _tool_middleware_trace = list(tool_request_middleware_trace or [])
+    # Memory OS dispatch-time preflight gate.  This is deliberately separate
+    # from plugin pre_tool_call hooks: pre_tool_block_checked only means the
+    # plugin hook already ran in the caller; it must not skip memory policy
+    # enforcement.  Keep this as a positive-control tested hard gate.
     try:
-        from hermes_cli.middleware import apply_tool_request_middleware
-
-        if not skip_tool_request_middleware:
-            _tool_request_mw = apply_tool_request_middleware(
-                function_name,
-                function_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            )
-            function_args = _tool_request_mw.payload
-            _tool_middleware_trace = _tool_request_mw.trace
-    except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
+        from agent.memory_metacognition import get_tool_preflight_block_message
+        _memory_block_msg = get_tool_preflight_block_message(function_name, function_args)
+    except Exception as _memory_preflight_err:
+        logger.debug("Memory preflight gate failed open due to internal error: %s", _memory_preflight_err)
+        _memory_block_msg = None
+    if _memory_block_msg:
+        return json.dumps({"error": _memory_block_msg}, ensure_ascii=False)
 
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
@@ -1657,165 +1633,90 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name,
-                function_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                middleware_trace=list(_tool_middleware_trace),
+                function_name, function_args, task_id=effective_task_id or "",
             )
         except Exception:
             pass
     if block_message is not None:
-        result = json.dumps({"error": block_message}, ensure_ascii=False)
-        try:
-            from model_tools import _emit_post_tool_call_hook
-            _emit_post_tool_call_hook(
-                function_name=function_name,
-                function_args=function_args,
-                result=result,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                status="blocked",
-                error_type="plugin_block",
-                error_message=block_message,
-                middleware_trace=list(_tool_middleware_trace),
-            )
-        except Exception:
-            pass
-        return result
-
-    tool_start_time = time.monotonic()
-
-    def _finish_agent_tool(result: Any, observed_args: Optional[dict] = None) -> Any:
-        hook_args = observed_args if isinstance(observed_args, dict) else function_args
-        try:
-            from model_tools import _emit_post_tool_call_hook
-            _emit_post_tool_call_hook(
-                function_name=function_name,
-                function_args=hook_args,
-                result=result,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                duration_ms=int((time.monotonic() - tool_start_time) * 1000),
-                middleware_trace=list(_tool_middleware_trace),
-            )
-        except Exception:
-            pass
-        return result
+        return json.dumps({"error": block_message}, ensure_ascii=False)
 
     if function_name == "todo":
-        def _execute(next_args: dict) -> Any:
-            from tools.todo_tool import todo_tool as _todo_tool
-            return _finish_agent_tool(
-                _todo_tool(
-                    todos=next_args.get("todos"),
-                    merge=next_args.get("merge", False),
-                    store=agent._todo_store,
-                ),
-                next_args,
-            )
+        from tools.todo_tool import todo_tool as _todo_tool
+        return _todo_tool(
+            todos=function_args.get("todos"),
+            merge=function_args.get("merge", False),
+            store=agent._todo_store,
+        )
     elif function_name == "session_search":
-        def _execute(next_args: dict) -> Any:
-            session_db = agent._get_session_db_for_recall()
-            if not session_db:
-                from hermes_state import format_session_db_unavailable
-                return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}), next_args)
-            from tools.session_search_tool import session_search as _session_search
-            return _finish_agent_tool(
-                _session_search(
-                    query=next_args.get("query", ""),
-                    role_filter=next_args.get("role_filter"),
-                    limit=next_args.get("limit", 3),
-                    session_id=next_args.get("session_id"),
-                    around_message_id=next_args.get("around_message_id"),
-                    window=next_args.get("window", 5),
-                    sort=next_args.get("sort"),
-                    db=session_db,
-                    current_session_id=agent.session_id,
-                ),
-                next_args,
-            )
+        session_db = agent._get_session_db_for_recall()
+        if not session_db:
+            from hermes_state import format_session_db_unavailable
+            return json.dumps({"success": False, "error": format_session_db_unavailable()})
+        from tools.session_search_tool import session_search as _session_search
+        if getattr(agent, "_shared_chat_memory_scope", False):
+            return json.dumps({
+                "success": False,
+                "error": "session_search is disabled in shared group/channel contexts to prevent private conversation leakage. Use group memory instead.",
+            }, ensure_ascii=False)
+        return _session_search(
+            query=function_args.get("query", ""),
+            role_filter=function_args.get("role_filter"),
+            limit=function_args.get("limit", 3),
+            session_id=function_args.get("session_id"),
+            around_message_id=function_args.get("around_message_id"),
+            window=function_args.get("window", 5),
+            sort=function_args.get("sort"),
+            db=session_db,
+            current_session_id=agent.session_id,
+            user_id=getattr(agent, "_user_id", None),
+            source=getattr(agent, "platform", None),
+        )
     elif function_name == "memory":
-        def _execute(next_args: dict) -> Any:
-            target = next_args.get("target", "memory")
-            from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=next_args.get("action"),
-                target=target,
-                content=next_args.get("content"),
-                old_text=next_args.get("old_text"),
-                store=agent._memory_store,
-            )
-            # Bridge: notify external memory provider of built-in memory writes
-            if agent._memory_manager and next_args.get("action") in {"add", "replace"}:
-                try:
-                    agent._memory_manager.on_memory_write(
-                        next_args.get("action", ""),
-                        target,
-                        next_args.get("content", ""),
-                        metadata=agent._build_memory_write_metadata(
-                            task_id=effective_task_id,
-                            tool_call_id=tool_call_id,
-                        ),
-                    )
-                except Exception:
-                    pass
-            return _finish_agent_tool(result, next_args)
+        target = function_args.get("target", "memory")
+        from tools.memory_tool import memory_tool as _memory_tool
+        result = _memory_tool(
+            action=function_args.get("action"),
+            target=target,
+            content=function_args.get("content"),
+            old_text=function_args.get("old_text"),
+            store=agent._memory_store,
+        )
+        # Bridge: notify external memory provider of built-in memory writes
+        if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
+            try:
+                agent._memory_manager.on_memory_write(
+                    function_args.get("action", ""),
+                    target,
+                    function_args.get("content", ""),
+                    metadata=agent._build_memory_write_metadata(
+                        task_id=effective_task_id,
+                        tool_call_id=tool_call_id,
+                    ),
+                )
+            except Exception:
+                pass
+        return result
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
-        def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, next_args), next_args)
+        return agent._memory_manager.handle_tool_call(function_name, function_args)
     elif function_name == "clarify":
-        def _execute(next_args: dict) -> Any:
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _finish_agent_tool(
-                _clarify_tool(
-                    question=next_args.get("question", ""),
-                    choices=next_args.get("choices"),
-                    callback=agent.clarify_callback,
-                ),
-                next_args,
-            )
+        from tools.clarify_tool import clarify_tool as _clarify_tool
+        return _clarify_tool(
+            question=function_args.get("question", ""),
+            choices=function_args.get("choices"),
+            callback=agent.clarify_callback,
+        )
     elif function_name == "delegate_task":
-        def _execute(next_args: dict) -> Any:
-            return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+        return agent._dispatch_delegate_task(function_args)
     else:
-        def _execute(next_args: dict) -> Any:
-            return _ra().handle_function_call(
-                function_name, next_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
-                skip_tool_request_middleware=True,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                tool_request_middleware_trace=list(_tool_middleware_trace),
-            )
-
-    from hermes_cli.middleware import run_tool_execution_middleware
-
-    return run_tool_execution_middleware(
-        function_name,
-        function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+        return _ra().handle_function_call(
+            function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id,
+            session_id=agent.session_id or "",
+            enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+            skip_pre_tool_call_hook=True,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        )
 
 
 
@@ -2379,7 +2280,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             existing = getattr(agent, "_pending_steer", None)
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
-    marker = format_steer_marker(steer_text)
+    marker = f"\n\nUser guidance: {steer_text}"
     existing_content = messages[target_idx].get("content", "")
     if not isinstance(existing_content, str):
         # Anthropic multimodal content blocks — preserve them and append

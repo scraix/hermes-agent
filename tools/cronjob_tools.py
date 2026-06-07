@@ -7,10 +7,11 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 from hermes_constants import display_hermes_home
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cron.jobs import (
     AmbiguousJobReference,
     create_job,
+    get_job,
     list_jobs,
     parse_schedule,
     pause_job,
@@ -34,36 +36,10 @@ from cron.jobs import (
 
 
 # ---------------------------------------------------------------------------
-# Cron prompt scanning
+# Cron prompt scanning — critical-severity patterns only, since cron prompts
+# run in fresh sessions with full tool access.
 # ---------------------------------------------------------------------------
-#
-# Two threat surfaces, two scanners:
-#
-#   1. User-supplied cron prompt (small, written as a directive).
-#      Strict scanning is appropriate — a legit cron prompt has no business
-#      saying "cat ~/.hermes/.env" or "rm -rf /". `_scan_cron_prompt()` runs
-#      against this at create/update time and as a runtime defense-in-depth.
-#
-#   2. Assembled prompt that includes loaded skill content (large markdown
-#      bodies, often security docs, postmortems, runbooks discussing attack
-#      patterns in PROSE). Reusing the strict patterns here false-positives
-#      every time a skill *describes* a command — see #3968 follow-up: the
-#      `hermes-agent-dev` skill contains a security postmortem mentioning
-#      `cat ~/.hermes/.env`, which tripped `read_secrets` and silently
-#      killed all PR-scout jobs.
-#
-#      Skill bodies are user-curated and scanned at install time by
-#      `skills_guard.py`. The runtime cron scan only needs to catch the
-#      patterns whose phrasing does NOT survive normal English prose:
-#      classic prompt-injection directives ("ignore previous instructions",
-#      "disregard your rules"), deception directives, and invisible
-#      unicode. `_scan_cron_skill_assembled()` runs against the assembled
-#      prompt with this tighter pattern set.
-#
-# Both scanners share the invisible-unicode check and the GitHub Authorization
-# header exemption.
 
-# Strict patterns — applied to the user prompt only.
 _CRON_THREAT_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
@@ -73,20 +49,6 @@ _CRON_THREAT_PATTERNS = [
     (r'authorized_keys', "ssh_backdoor"),
     (r'/etc/sudoers|visudo', "sudoers_mod"),
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
-]
-
-# Looser pattern set — applied to the assembled prompt when skills are
-# attached. Only patterns whose phrasing is unambiguous in any context;
-# command-shape patterns are dropped because they false-positive on prose
-# in security docs / postmortems. Skill bodies are scanned at install time
-# by `skills_guard.py`, so the runtime cron scan is purely a tripwire for
-# obvious injection directives surviving a malicious skill that slipped
-# through install.
-_CRON_SKILL_ASSEMBLED_PATTERNS = [
-    (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
-    (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
 ]
 
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
@@ -152,77 +114,23 @@ def _strip_legitimate_emoji_zwj(prompt: str) -> str:
     return ''.join(cleaned)
 
 
-def _strip_cron_safe_constructs(prompt: str) -> str:
-    """Strip the GitHub `Authorization: token $GITHUB_TOKEN` auth-header
-    pattern so it doesn't trip the broader curl-auth-header exfil rule.
-
-    Allows the bundled GitHub skill fallback without opening a blanket
-    exemption for arbitrary Authorization-header exfiltration.
-    """
+def _scan_cron_prompt(prompt: str) -> str:
+    """Scan a cron prompt for critical threats. Returns error string if blocked, else empty."""
     github_auth_header = re.search(
         rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
         r'\s+["\']?https://api\.github\.com(?:/|\b)',
         prompt,
         re.IGNORECASE,
     )
+    prompt_to_scan = prompt
     if github_auth_header:
-        return prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
-    return prompt
-
-
-def _check_invisible_unicode(prompt: str) -> str:
-    """Return an error string if the prompt contains invisible-unicode
-    injection markers (ZWJ inside legitimate emoji sequences is allowed).
-    """
-    prompt_for_invisible_scan = _strip_legitimate_emoji_zwj(prompt)
+        # Allow the bundled GitHub skill fallback shape without opening a
+        # blanket exemption for arbitrary Authorization-header exfiltration.
+        prompt_to_scan = prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
+    prompt_for_invisible_scan = _strip_legitimate_emoji_zwj(prompt_to_scan)
     for char in _CRON_INVISIBLE_CHARS:
         if char in prompt_for_invisible_scan:
             return f"Blocked: prompt contains invisible unicode U+{ord(char):04X} (possible injection)."
-    return ""
-
-
-def _strip_invisible_unicode(prompt: str) -> tuple[str, list[str]]:
-    """Strip invisible-unicode characters from *prompt*, preserving the ZWJ
-    that lives inside legitimate emoji sequences.
-
-    Returns ``(cleaned_prompt, removed_codepoints)`` where ``removed_codepoints``
-    is the sorted list of ``U+XXXX`` labels that were stripped (empty when the
-    prompt was already clean). Used by the skills-attached cron path, where the
-    skill body is already vetted at install time by ``skills_guard.py`` — a
-    stray zero-width space in a code example should be sanitized, not turned
-    into a hard block that permanently kills the job.
-    """
-    if not prompt:
-        return prompt, []
-    # Keep emoji-ZWJ: temporarily remove the legitimate joiners, scan/strip the
-    # rest, then the legitimate joiners survive because we operate on the
-    # original string and only drop chars that are NOT part of an emoji cluster.
-    removed: set[str] = set()
-    cleaned: list[str] = []
-    for idx, ch in enumerate(prompt):
-        if ch in _CRON_INVISIBLE_CHARS:
-            if ch == '\u200d' and _zwj_has_emoji_neighbour(prompt, idx):
-                cleaned.append(ch)  # legitimate emoji joiner — keep
-                continue
-            removed.add(f"U+{ord(ch):04X}")
-            continue
-        cleaned.append(ch)
-    return ''.join(cleaned), sorted(removed)
-
-
-def _scan_cron_prompt(prompt: str) -> str:
-    """Scan the USER-SUPPLIED cron prompt for critical threats.
-
-    Strict pattern set — used at job create/update time and as a runtime
-    defense-in-depth for prompts authored before the scanner existed.
-    The user prompt is small and directive; bare `cat .env` or `rm -rf /`
-    there is a smoking gun, not prose. Returns an error string when
-    blocked, else empty string.
-    """
-    prompt_to_scan = _strip_cron_safe_constructs(prompt)
-    invisible_err = _check_invisible_unicode(prompt_to_scan)
-    if invisible_err:
-        return invisible_err
     for pattern, pid in _CRON_THREAT_PATTERNS:
         if re.search(pattern, prompt_to_scan, re.IGNORECASE):
             return f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."
@@ -232,38 +140,24 @@ def _scan_cron_prompt(prompt: str) -> str:
     return ""
 
 
-def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
-    """Scan an ASSEMBLED cron prompt that includes loaded skill content.
+def _scan_cron_skill_assembled(prompt: str) -> str:
+    """Scan a runtime-assembled cron prompt that includes skill content.
 
-    Looser pattern set — only catches unambiguous prompt-injection
-    directives. Drops command-shape patterns (cat .env, rm -rf /,
-    authorized_keys, /etc/sudoers) because they false-positive on
-    legitimate skill markdown that *describes* attack commands in
-    security postmortems and runbooks.
-
-    Invisible unicode is SANITIZED, not blocked. Skill bodies are
-    user-curated and already scanned at install time by
-    ``skills_guard.py``; a stray zero-width space in a code example
-    (common in copy-pasted unicode docs) should not permanently kill the
-    job. The offending codepoints are stripped and logged, the cleaned
-    prompt is returned. The hard block remains for raw user prompts via
-    ``_scan_cron_prompt`` — that path is the actual injection surface.
-
-    Returns ``(cleaned_prompt, error)``; ``error`` is empty when the
-    prompt passed (after sanitization).
+    Skill markdown commonly documents attack-shaped shell snippets in prose.
+    Runtime scanning therefore keeps the unambiguous prompt-injection and
+    invisible-unicode checks, but intentionally drops command-shape exfil
+    patterns; skills are vetted separately at install/edit time.
     """
-    cleaned, removed = _strip_invisible_unicode(assembled)
-    if removed:
-        logger.warning(
-            "Cron skill-assembled prompt: stripped %d invisible-unicode "
-            "char(s) (%s) from vetted skill content",
-            len(removed), ", ".join(removed),
-        )
-    prompt_to_scan = _strip_cron_safe_constructs(cleaned)
-    for pattern, pid in _CRON_SKILL_ASSEMBLED_PATTERNS:
-        if re.search(pattern, prompt_to_scan, re.IGNORECASE):
-            return cleaned, f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."
-    return cleaned, ""
+    prompt_for_invisible_scan = _strip_legitimate_emoji_zwj(prompt)
+    for char in _CRON_INVISIBLE_CHARS:
+        if char in prompt_for_invisible_scan:
+            return f"Blocked: prompt contains invisible unicode U+{ord(char):04X} (possible injection)."
+    for pattern, pid in _CRON_THREAT_PATTERNS:
+        if pid in {"read_secrets", "ssh_backdoor", "sudoers_mod", "destructive_root_rm"}:
+            continue
+        if re.search(pattern, prompt, re.IGNORECASE):
+            return f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection payloads."
+    return ""
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
@@ -287,8 +181,14 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
 
 
 def _repeat_display(job: Dict[str, Any]) -> str:
-    times = (job.get("repeat") or {}).get("times")
-    completed = (job.get("repeat") or {}).get("completed", 0)
+    repeat = job.get("repeat")
+    if not isinstance(repeat, dict):
+        text = str(repeat or "").strip()
+        if not text or text.lower() in {"forever", "infinite", "always"}:
+            return "forever"
+        return text
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0)
     if times is None:
         return "forever"
     if times == 1:
@@ -324,8 +224,8 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
     """
     if not model_obj or not isinstance(model_obj, dict):
         return (None, None)
-    model_name = (model_obj.get("model") or "").strip() or None
-    provider_name = (model_obj.get("provider") or "").strip() or None
+    model_name = str(model_obj.get("model") or "").strip() or None
+    provider_name = str(model_obj.get("provider") or "").strip() or None
     # Bare "custom" is an incomplete spec — the canonical form is
     # "custom:<name>" matching a custom_providers entry. LLMs frequently
     # supply the bare type because the schema does not advertise the
@@ -417,6 +317,231 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _load_academic_identity_guard_config() -> Dict[str, Any]:
+    """Load deployment-local academic identity guard config, if present.
+
+    This is intentionally data-driven and lives under HERMES_HOME, not in code:
+    user-specific subject boundaries must not be hardcoded into shared upstream
+    logic. Missing/invalid config disables this deployment-specific guard.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "academic_identity_guard.json"
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.exception("Failed to load academic identity guard config")
+        return {}
+
+
+def _script_text_for_guard(script: Optional[str]) -> str:
+    if not script or not script.strip():
+        return ""
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "scripts" / script.strip()
+        if not path.exists() or not path.is_file():
+            return ""
+        # Keep bounded; cron scripts should not be huge and the guard only
+        # needs enough context to catch subject lists / schedules.
+        return path.read_text(encoding="utf-8", errors="replace")[:200_000]
+    except Exception:
+        logger.exception("Failed to read cron script for academic identity guard: %s", script)
+        return ""
+
+
+def _target_chat_ids_for_deliver(deliver: Optional[str]) -> List[str]:
+    text = _normalize_deliver_param(deliver) or ""
+    ids: List[str] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("telegram:"):
+            pieces = part.split(":")
+            if len(pieces) >= 2 and pieces[1]:
+                ids.append(pieces[1])
+    return ids
+
+
+def _cron_academic_identity_guard(
+    *,
+    name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    script: Optional[str] = None,
+    deliver: Optional[str] = None,
+) -> Optional[str]:
+    """Enforce a deployment-local identity contract for user-targeted cron jobs.
+
+    This is intentionally generic:
+    - Target is resolved from explicit delivery (`telegram:<chat_id>`) or session env.
+    - Each target user declares identity aliases and allowed academic subjects.
+    - A global subject catalog maps aliases -> canonical subjects.
+    - Content in prompt *and* no_agent script body is checked.
+
+    The goal is to prevent cross-user/task leakage as a class of bugs, not to
+    maintain per-user ad-hoc `blocked_subjects` patches.  The old
+    `blocked_subjects` key is still honored as a backward-compatible override,
+    but the preferred model is `subject_catalog` + per-user `allowed_subjects`.
+    """
+    cfg = _load_academic_identity_guard_config()
+    users = cfg.get("users") if isinstance(cfg, dict) else None
+    if not isinstance(users, dict) or not users:
+        return None
+
+    content_parts = [str(name or ""), str(prompt or ""), _script_text_for_guard(script)]
+    content = "\n".join(part for part in content_parts if part)
+    if not content.strip():
+        return None
+    lowered = content.lower()
+
+    targets = set(_target_chat_ids_for_deliver(deliver))
+    # If deliver is origin/local and no explicit target is visible, use session
+    # chat id as a best-effort target. Explicit cross-user delivery still wins.
+    if not targets:
+        try:
+            from gateway.session_context import get_session_env
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+            platform = get_session_env("HERMES_SESSION_PLATFORM")
+            if platform == "telegram" and chat_id:
+                targets.add(chat_id)
+        except Exception:
+            pass
+
+    def _aliases(rule: Dict[str, Any], chat_id: str) -> List[str]:
+        vals: List[str] = [str(chat_id)]
+        for key in ("label", "name"):
+            if rule.get(key):
+                vals.append(str(rule[key]))
+        for key in ("aliases", "identity_aliases"):
+            raw = rule.get(key) or []
+            if isinstance(raw, str):
+                vals.append(raw)
+            else:
+                vals.extend(str(x) for x in raw if str(x))
+        out: List[str] = []
+        for v in vals:
+            v = v.strip()
+            if v and v not in out:
+                out.append(v)
+        return out
+
+    def _term_present(term: str, text: str) -> bool:
+        if not term:
+            return False
+        # ASCII terms get token-ish boundaries; CJK phrases are substring terms.
+        if re.fullmatch(r"[A-Za-z0-9_ .@:+-]+", term):
+            return re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+        return term.lower() in text.lower()
+
+    def _identity_mismatch_phrases(alias: str) -> List[str]:
+        # Only block target-bearing uses, not privacy guard text like
+        # "do not use another user's private context".
+        compact = alias.replace(" ", r"\s*")
+        return [
+            rf"\bfor\s+{compact}\b",
+            rf"\b{compact}'s\b",
+            rf"\b{compact}\s+shen\b" if alias.lower() == "steven" else r"a^",
+            rf"为\s*{compact}",
+            rf"給\s*{compact}",
+            rf"给\s*{compact}",
+            rf"專為\s*{compact}",
+            rf"专为\s*{compact}",
+            rf"{compact}\s*的",
+            rf"{compact}\s*專屬",
+            rf"{compact}\s*专属",
+            rf"/memories/{re.escape(alias)}/" if alias.isdigit() else r"a^",
+        ]
+
+    def _is_academicish() -> bool:
+        global_triggers = cfg.get("academic_triggers") or []
+        user_triggers: List[str] = []
+        for rule in users.values():
+            if isinstance(rule, dict):
+                raw = rule.get("academic_triggers") or []
+                user_triggers.extend(str(x) for x in raw if str(x))
+        triggers = [str(x) for x in [*global_triggers, *user_triggers] if str(x)]
+        if not triggers:
+            triggers = ["exam", "revision", "study", "homework", "practice", "DSE", "考试", "考試", "温书", "溫書", "复习", "復習", "学业", "學業", "科目"]
+        return any(t.lower() in lowered for t in triggers)
+
+    def _subject_catalog() -> Dict[str, List[str]]:
+        catalog = cfg.get("subject_catalog") or cfg.get("global_subject_catalog") or {}
+        if isinstance(catalog, dict) and catalog:
+            return {str(k): [str(x) for x in (v if isinstance(v, list) else [v]) if str(x)] for k, v in catalog.items()}
+        # Generic DSE-ish fallback; deployments should override/extend this.
+        return {
+            "English": ["English", "英文", "英语", "英語"],
+            "Chinese": ["Chinese", "中文", "中國語文", "中国语文"],
+            "Maths": ["Maths", "Mathematics", "数学", "數學"],
+            "Physics": ["Physics", "物理"],
+            "Chemistry": ["Chemistry", "化学", "化學"],
+            "Biology": ["Biology", "Bio", "生物"],
+            "Economics": ["Economics", "Econ", "经济", "經濟"],
+            "Geography": ["Geography", "地理"],
+            "History": ["History", "歷史", "历史"],
+            "Chinese History": ["Chinese History", "中史", "中国历史", "中國歷史"],
+            "ICT": ["ICT"],
+            "CSD": ["CSD", "公民", "社會發展", "社会发展"],
+            "M1": ["M1"],
+            "M2": ["M2"],
+            "BAFS": ["BAFS"],
+            "Chinese Literature": ["Chinese Literature", "中化", "文学", "文學"],
+        }
+
+    target_ids = targets or set(str(k) for k in users.keys())
+    for chat_id in target_ids:
+        rule = users.get(str(chat_id))
+        if not isinstance(rule, dict):
+            continue
+        label = str(rule.get("label") or rule.get("name") or chat_id)
+
+        # 1) Cross-user identity contract: if a job delivered to user A is
+        # target-bearing for user B, reject. This covers report clones, tutoring
+        # jobs, and prompts reading another user's memory path.
+        for other_id, other_rule in users.items():
+            if str(other_id) == str(chat_id) or not isinstance(other_rule, dict):
+                continue
+            for alias in _aliases(other_rule, str(other_id)):
+                for pat in _identity_mismatch_phrases(alias):
+                    if re.search(pat, content, re.IGNORECASE):
+                        other_label = other_rule.get("label") or other_rule.get("name") or other_id
+                        return (
+                            f"Blocked: identity contract mismatch. Cron delivery targets {label} ({chat_id}) "
+                            f"but content appears target-bearing for {other_label} ({other_id}) via alias {alias!r}. "
+                            "Use explicit per-user job names, deliver targets, and prompts; do not clone reports across users without rewriting the target contract."
+                        )
+
+        # 2) Academic subject contract: global subject catalog + per-user allowlist.
+        if _is_academicish():
+            allowed = {str(x) for x in (rule.get("allowed_subjects") or []) if str(x)}
+            catalog = _subject_catalog()
+            mentioned: List[Tuple[str, str]] = []
+            for canonical, aliases in catalog.items():
+                for alias in aliases:
+                    if _term_present(alias, content):
+                        mentioned.append((canonical, alias))
+                        break
+            blocked_legacy = {str(x) for x in (rule.get("blocked_subjects") or []) if str(x)}
+            bad: List[str] = []
+            for canonical, alias in mentioned:
+                if blocked_legacy and (canonical in blocked_legacy or alias in blocked_legacy):
+                    bad.append(f"{canonical} ({alias})")
+                elif allowed and canonical not in allowed and alias not in allowed:
+                    bad.append(f"{canonical} ({alias})")
+            if bad:
+                rationale = rule.get("rationale") or "content mentions subjects outside the target user's declared subject contract"
+                unique_bad = sorted(set(bad), key=bad.index)
+                return (
+                    f"Blocked: academic identity contract for {label} ({chat_id}) found subjects outside the user's allowed_subjects: "
+                    f"{', '.join(unique_bad)}. {rationale} "
+                    "Fix the job content from verified user facts, or update academic_identity_guard.json with the new subject contract."
+                )
+    return None
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -483,6 +608,31 @@ def cronjob(
     del task_id  # unused but kept for handler signature compatibility
 
     try:
+        if isinstance(action, dict):
+            payload = action
+            return cronjob(
+                action=payload.get("action", ""),
+                job_id=payload.get("job_id"),
+                prompt=payload.get("prompt"),
+                schedule=payload.get("schedule"),
+                name=payload.get("name"),
+                repeat=payload.get("repeat"),
+                deliver=payload.get("deliver"),
+                include_disabled=payload.get("include_disabled", include_disabled),
+                skill=payload.get("skill"),
+                skills=payload.get("skills"),
+                model=_resolve_model_override(payload.get("model"))[1] or payload.get("model"),
+                provider=_resolve_model_override(payload.get("model"))[0] or payload.get("provider"),
+                base_url=payload.get("base_url"),
+                reason=payload.get("reason"),
+                script=payload.get("script"),
+                context_from=payload.get("context_from"),
+                enabled_toolsets=payload.get("enabled_toolsets"),
+                workdir=payload.get("workdir"),
+                profile=payload.get("profile"),
+                no_agent=payload.get("no_agent"),
+                task_id=payload.get("task_id"),
+            )
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
@@ -514,6 +664,15 @@ def cronjob(
                 script_error = _validate_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
+
+            academic_guard_error = _cron_academic_identity_guard(
+                name=name,
+                prompt=prompt,
+                script=script,
+                deliver=deliver,
+            )
+            if academic_guard_error:
+                return tool_error(academic_guard_error, success=False)
 
             # Validate context_from references existing jobs
             if context_from:
@@ -710,6 +869,20 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
+
+            effective_name = updates.get("name", job.get("name"))
+            effective_prompt = updates.get("prompt", job.get("prompt"))
+            effective_script = updates.get("script", job.get("script"))
+            effective_deliver = updates.get("deliver", job.get("deliver"))
+            academic_guard_error = _cron_academic_identity_guard(
+                name=effective_name,
+                prompt=effective_prompt,
+                script=effective_script,
+                deliver=effective_deliver,
+            )
+            if academic_guard_error:
+                return tool_error(academic_guard_error, success=False)
+
             updated = update_job(job_id, updates)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
@@ -744,7 +917,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run"
             },
             "job_id": {
                 "type": "string",
@@ -756,7 +929,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp"
             },
             "name": {
                 "type": "string",
@@ -768,7 +941,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:<chat_id>:<thread_id>', 'discord:#engineering', 'sms:+<phone_number>', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
             },
             "skills": {
                 "type": "array",

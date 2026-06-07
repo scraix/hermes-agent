@@ -137,6 +137,7 @@ class TestGenerate:
         assert result["error_type"] == "auth_required"
 
     def test_b64_saves_to_cache(self, provider, tmp_path):
+        import base64
         png_bytes = bytes.fromhex(_PNG_HEX)
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
@@ -228,44 +229,66 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
 
-    def test_url_response_is_cached_locally(self, provider):
-        """OpenAI URL response (if API ever returns one) is cached locally.
-
-        Pre-fix this asserted the bare URL passed through; symmetric to the
-        xAI #26942 fix.  Even though gpt-image-2 returns b64 today, every
-        ``image_gen`` provider must guarantee the gateway gets a stable
-        file path so ephemeral signed URLs can't expire mid-flight.
-        """
+    def test_url_fallback_if_api_changes(self, provider):
+        """Defensive: if OpenAI ever returns URL instead of b64, pass through."""
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(
             b64=None, url="https://example.com/img.png",
         )
 
-        with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            return_value=Path("/tmp/openai_gpt-image-2_20260524_000000_deadbeef.png"),
-        ) as mock_save_url:
-            result = provider.generate("a cat")
-
-        assert result["success"] is True
-        assert result["image"].startswith("/")
-        assert "example.com" not in result["image"]
-        mock_save_url.assert_called_once()
-
-    def test_url_response_falls_back_to_bare_url_when_download_fails(self, provider):
-        """Cache failure must not turn into a tool error — symmetric with xAI."""
-        import requests as req_lib
-
-        fake_client = MagicMock()
-        fake_client.images.generate.return_value = _fake_response(
-            b64=None, url="https://example.com/img.png",
-        )
-
-        with _patched_openai(fake_client), patch(
-            "plugins.image_gen.openai.save_url_image",
-            side_effect=req_lib.HTTPError("404 from CDN"),
-        ):
+        with _patched_openai(fake_client):
             result = provider.generate("a cat")
 
         assert result["success"] is True
         assert result["image"] == "https://example.com/img.png"
+
+
+class TestEdit:
+    def test_missing_image_path_rejected(self, provider):
+        result = provider.edit("clean acne", "")
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+
+    def test_input_file_not_found(self, provider):
+        result = provider.edit("clean acne", "/tmp/does-not-exist.png")
+        assert result["success"] is False
+        assert result["error_type"] == "file_not_found"
+
+    def test_edit_b64_saves_to_cache_and_calls_images_edit(self, provider, tmp_path):
+        input_path = tmp_path / "input.png"
+        input_path.write_bytes(bytes.fromhex(_PNG_HEX))
+        fake_client = MagicMock()
+        fake_client.images.edit.return_value = _fake_response(b64=_b64_png(), revised_prompt="cleaned portrait")
+
+        with _patched_openai(fake_client):
+            result = provider.edit("remove blemishes, preserve face", str(input_path), aspect_ratio="square")
+
+        assert result["success"] is True
+        assert result["provider"] == "openai"
+        assert result["mode"] == "edit"
+        assert result["input_image"] == str(input_path)
+        assert result["quality"] == "medium"
+        assert result["revised_prompt"] == "cleaned portrait"
+        saved = Path(result["image"])
+        assert saved.exists()
+        assert saved.read_bytes() == bytes.fromhex(_PNG_HEX)
+        call_kwargs = fake_client.images.edit.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-image-2"
+        assert call_kwargs["quality"] == "medium"
+        assert call_kwargs["size"] == "1024x1024"
+        assert "response_format" not in call_kwargs
+
+    def test_edit_accepts_mask(self, provider, tmp_path):
+        input_path = tmp_path / "input.png"
+        mask_path = tmp_path / "mask.png"
+        input_path.write_bytes(bytes.fromhex(_PNG_HEX))
+        mask_path.write_bytes(bytes.fromhex(_PNG_HEX))
+        fake_client = MagicMock()
+        fake_client.images.edit.return_value = _fake_response(url="https://example.com/edited.png")
+
+        with _patched_openai(fake_client):
+            result = provider.edit("change background", str(input_path), mask_path=str(mask_path))
+
+        assert result["success"] is True
+        assert result["image"] == "https://example.com/edited.png"
+        assert "mask" in fake_client.images.edit.call_args.kwargs

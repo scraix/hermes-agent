@@ -30,13 +30,13 @@ from typing import List, Dict, Any, Set, Optional
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
     # Web
-    "web_search", "web_extract",
+    "web_search", "web_extract", "deep_research",
     # Terminal + process management
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
-    "vision_analyze", "image_generate",
+    "vision_analyze", "image_generate", "image_edit", "image_capability_diagnose",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -48,8 +48,20 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Memory Graph (URI-tree structured memory)
+    "memory_graph_read", "memory_graph_create", "memory_graph_update",
+    "memory_graph_delete", "memory_graph_list", "memory_graph_search",
+    "memory_graph_alias", "memory_graph_glossary_add", "memory_graph_glossary_scan",
+    "memory_graph_recall", "memory_graph_orphans", "memory_graph_random",
+    "memory_graph_diagnostics", "memory_graph_purge",
     # Session history search
     "session_search",
+    # Memory Graph (Memory OS)
+    "memory_graph_read", "memory_graph_create", "memory_graph_update",
+    "memory_graph_delete", "memory_graph_list", "memory_graph_search",
+    "memory_graph_alias", "memory_graph_glossary_add", "memory_graph_glossary_scan",
+    "memory_graph_recall", "memory_graph_orphans", "memory_graph_random",
+    "memory_graph_diagnostics", "memory_graph_purge",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -89,7 +101,7 @@ TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
-        "tools": ["web_search", "web_extract"],
+        "tools": ["web_search", "web_extract", "deep_research"],
         "includes": []  # No other toolsets included
     },
     
@@ -124,7 +136,7 @@ TOOLSETS = {
     
     "image_gen": {
         "description": "Creative generation tools (images)",
-        "tools": ["image_generate"],
+        "tools": ["image_generate", "image_edit", "image_capability_diagnose"],
         "includes": []
     },
 
@@ -228,6 +240,19 @@ TOOLSETS = {
         "includes": []
     },
     
+
+    "memory_graph": {
+        "description": "Persistent Memory Graph tools for structured long-term memory",
+        "tools": [
+            "memory_graph_read", "memory_graph_create", "memory_graph_update",
+            "memory_graph_delete", "memory_graph_list", "memory_graph_search",
+            "memory_graph_alias", "memory_graph_glossary_add", "memory_graph_glossary_scan",
+            "memory_graph_recall", "memory_graph_orphans", "memory_graph_random",
+            "memory_graph_diagnostics", "memory_graph_purge",
+        ],
+        "includes": [],
+    },
+
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
@@ -373,7 +398,7 @@ TOOLSETS = {
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
-            "vision_analyze", "image_generate",
+            "vision_analyze", "image_generate", "image_edit", "image_capability_diagnose",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation

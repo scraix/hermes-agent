@@ -305,6 +305,25 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS skill_route_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    task_id TEXT,
+    turn_index INTEGER,
+    user_message_sha256_16 TEXT NOT NULL,
+    route_plan_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_route_plans_session
+    ON skill_route_plans(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_route_plans_status
+    ON skill_route_plans(session_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 
@@ -396,35 +415,15 @@ class SessionDB:
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
-        self.read_only = read_only
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
         self._write_count = 0
         self._fts_enabled = False
         self._fts_unavailable_warned = False
         try:
-            if read_only:
-                # Read-only attach for cross-profile aggregation: SELECT-only,
-                # so we skip schema init entirely (no DDL, no FTS probe, no
-                # column reconcile). Crucially this takes NO write lock, so
-                # polling another profile's live DB on every sidebar refresh
-                # never contends with that profile's running backend. The DB
-                # must already exist + be initialised (callers guard on
-                # db_path.exists()); a SELECT against an empty file raises and
-                # the caller degrades per-profile.
-                self._conn = sqlite3.connect(
-                    f"file:{self.db_path}?mode=ro",
-                    uri=True,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                return
-
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
                 str(self.db_path),
                 check_same_thread=False,
@@ -615,27 +614,17 @@ class SessionDB:
         )
 
     def _try_wal_checkpoint(self) -> None:
-        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
+        """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
 
-        Flushes committed WAL frames back into the main DB file and
-        truncates the WAL file to zero bytes.  Keeps the WAL from
-        growing unbounded when many processes hold persistent
+        Flushes committed WAL frames back into the main DB file for any
+        frames that no other connection currently needs.  Keeps the WAL
+        from growing unbounded when many processes hold persistent
         connections.
-
-        PASSIVE checkpoint was previously used here, but it never
-        truncates the WAL file — the file stays at its high-water
-        mark until an explicit TRUNCATE is called (which only
-        happened inside the infrequent vacuum()).
-
-        TRUNCATE may block writers briefly while checkpointing, but
-        _try_wal_checkpoint is called off the hot path (every 50
-        writes) and already runs under ``self._lock``, so the
-        additional hold time is negligible.
         """
         try:
             with self._lock:
                 result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                    "PRAGMA wal_checkpoint(PASSIVE)"
                 ).fetchone()
                 if result and result[1] > 0:
                     logger.debug(
@@ -648,13 +637,13 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Attempts a PASSIVE WAL checkpoint first so that exiting processes
+        help keep the WAL file from growing unbounded.
         """
         with self._lock:
             if self._conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception:
                     pass
                 self._conn.close()
@@ -1134,24 +1123,6 @@ class SessionDB:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
-    def update_session_meta(
-        self,
-        session_id: str,
-        model_config_json: str,
-        model: Optional[str] = None,
-    ) -> None:
-        """Update model_config and optionally model for an existing session.
-
-        Uses COALESCE so that passing model=None leaves the stored model
-        column unchanged.  Routes through _execute_write for the standard
-        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
-        """
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
-            )
-        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -1601,6 +1572,95 @@ class SessionDB:
             current = row["id"]
         return current
 
+
+    def save_skill_route_plan(
+        self,
+        session_id: str,
+        route_plan: Dict[str, Any],
+        *,
+        task_id: Optional[str] = None,
+        user_message_sha256_16: Optional[str] = None,
+        status: str = "active",
+        ttl_seconds: Optional[float] = None,
+        turn_index: Optional[int] = None,
+    ) -> int:
+        """Persist a sanitized skill route plan for cross-turn recovery."""
+        if not session_id:
+            raise ValueError("session_id is required")
+        plan = dict(route_plan or {})
+        plan.pop("raw_user_message", None)
+        plan.pop("user_message", None)
+        digest = user_message_sha256_16 or str(plan.get("user_message_sha256_16") or "")
+        if not digest:
+            raise ValueError("user_message_sha256_16 is required")
+        now = time.time()
+        expires_at = now + float(ttl_seconds) if ttl_seconds else None
+        payload = json.dumps(plan, ensure_ascii=False, sort_keys=True)
+
+        def _do(conn):
+            if status != "active":
+                conn.execute(
+                    """UPDATE skill_route_plans
+                       SET status = ?, updated_at = ?
+                       WHERE session_id = ?
+                         AND user_message_sha256_16 = ?
+                         AND status = 'active'
+                         AND (task_id IS ? OR task_id = ?)""",
+                    (status, now, session_id, digest, task_id, task_id),
+                )
+                return 0
+            cur = conn.execute(
+                """INSERT INTO skill_route_plans
+                   (session_id, task_id, turn_index, user_message_sha256_16,
+                    route_plan_json, status, created_at, updated_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, task_id, turn_index, digest, payload, status, now, now, expires_at),
+            )
+            return int(cur.lastrowid)
+        return self._execute_write(_do)
+
+    def get_latest_skill_route_plan(
+        self,
+        session_id: str,
+        *,
+        task_id: Optional[str] = None,
+        active_only: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent non-expired route plan for a session."""
+        if not session_id:
+            return None
+        clauses = ["session_id = ?", "(expires_at IS NULL OR expires_at > ?)"]
+        params: List[Any] = [session_id, time.time()]
+        if task_id is not None:
+            clauses.append("(task_id = ? OR task_id IS NULL)")
+            params.append(task_id)
+        if active_only:
+            clauses.append("status = 'active'")
+        sql = (
+            "SELECT * FROM skill_route_plans WHERE " + " AND ".join(clauses) +
+            " ORDER BY created_at DESC LIMIT 1"
+        )
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["route_plan"] = json.loads(out.get("route_plan_json") or "{}")
+        except Exception:
+            out["route_plan"] = {}
+        return out
+
+    def update_skill_route_plan_status(self, plan_id: int, status: str) -> None:
+        """Update a route plan lifecycle status (active/completed/blocked/expired)."""
+        now = time.time()
+        def _do(conn):
+            conn.execute(
+                "UPDATE skill_route_plans SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, int(plan_id)),
+            )
+        self._execute_write(_do)
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -1611,9 +1671,9 @@ class SessionDB:
         min_message_count: int = 0,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
+        user_id: str = None,
         include_archived: bool = False,
         archived_only: bool = False,
-        id_query: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1646,23 +1706,13 @@ class SessionDB:
         params = []
 
         if not include_children:
-            # Show root sessions and branch sessions, while still hiding
-            # sub-agent runs and compression continuations (which also carry a
-            # parent_session_id but were spawned while the parent was still
-            # live — i.e., started_at < parent.ended_at).
-            #
-            # Branch sessions are identified two ways, OR'd for robustness:
-            #   1. A stable ``_branched_from`` marker in model_config, written
-            #      by /branch at creation time. This survives the parent being
-            #      reopened and re-ended with a different end_reason (e.g.
-            #      tui_shutdown overwriting 'branched'), which otherwise hides
-            #      the branch — see issue #20856.
-            #   2. The legacy heuristic (parent ended with 'branched' before the
-            #      child started), covering branch sessions created before the
-            #      marker existed.
+            # Show root sessions and branch sessions (whose parent ended with
+            # end_reason='branched' before the child was created), while still
+            # hiding sub-agent runs and compression continuations (which also
+            # carry a parent_session_id but were spawned while the parent was
+            # still live — i.e., started_at < parent.ended_at).
             where_clauses.append(
                 "(s.parent_session_id IS NULL"
-                " OR json_extract(s.model_config, '$._branched_from') IS NOT NULL"
                 " OR EXISTS (SELECT 1 FROM sessions p"
                 "            WHERE p.id = s.parent_session_id"
                 "            AND p.end_reason = 'branched'"
@@ -1676,6 +1726,9 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
@@ -1685,16 +1738,6 @@ class SessionDB:
             where_clauses.append("s.archived = 0")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-        # Optional session-id filter, pushed into SQL so callers (Desktop
-        # session-id search) don't have to fetch every row and filter in
-        # Python. ``id_query`` is matched as a case-insensitive substring
-        # against each surfaced row's id AND every id in its forward
-        # compression chain — so searching a compression *root* id or a *tip*
-        # id both resolve to the same projected conversation. Only used in the
-        # order_by_last_active path (which builds the chain CTE); other callers
-        # pass id_query=None.
-        id_needle = (id_query or "").strip().lower()
         if order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
             # compression-continuation chain forward in SQL and taking the MAX
@@ -1707,28 +1750,6 @@ class SessionDB:
             # compression-continuation edges using the same criteria as
             # get_compression_tip (parent.end_reason='compression' AND
             # child.started_at >= parent.ended_at).
-            outer_where = where_sql
-            id_params: List[Any] = []
-            if id_needle:
-                # Admit a surfaced row if its own id or any id in its forward
-                # compression chain matches the needle. LIKE with a leading
-                # wildcard can't use an index, but the chain membership and
-                # the small result set keep this bounded — far cheaper than
-                # fetching every session and scanning in Python.
-                id_clause = (
-                    "EXISTS (SELECT 1 FROM chain cq"
-                    "        WHERE cq.root_id = s.id"
-                    "          AND LOWER(cq.cur_id) LIKE ? ESCAPE '\\')"
-                )
-                like_pattern = (
-                    "%"
-                    + id_needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                    + "%"
-                )
-                id_params = [like_pattern]
-                outer_where = (
-                    f"{where_sql} AND {id_clause}" if where_sql else f"WHERE {id_clause}"
-                )
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -1765,13 +1786,12 @@ class SessionDB:
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
-                {outer_where}
+                {where_sql}
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
-            # WHERE params apply twice (CTE seed + outer select); the id filter
-            # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            # WHERE params apply twice (CTE seed + outer select).
+            params = params + params + [limit, offset]
         else:
             query = f"""
                 SELECT s.*,
@@ -2709,10 +2729,9 @@ class SessionDB:
         """Sanitize user input for safe use in FTS5 MATCH queries.
 
         FTS5 has its own query syntax where characters like ``"``, ``(``, ``)``,
-        ``+``, ``*``, ``{``, ``}``, the column-filter operator ``:`` and bare
-        boolean operators (``AND``, ``OR``, ``NOT``) have special meaning.
-        Passing raw user input directly to MATCH can cause
-        ``sqlite3.OperationalError``.
+        ``+``, ``*``, ``{``, ``}`` and bare boolean operators (``AND``, ``OR``,
+        ``NOT``) have special meaning.  Passing raw user input directly to
+        MATCH can cause ``sqlite3.OperationalError``.
 
         Strategy:
         - Preserve properly paired quoted phrases (``"exact phrase"``)
@@ -2731,12 +2750,8 @@ class SessionDB:
 
         sanitized = re.sub(r'"[^"]*"', _preserve_quoted, query)
 
-        # Step 2: Strip remaining (unmatched) FTS5-special characters.  ``:`` is
-        # FTS5's column-filter operator (``col:term``); since the FTS table has a
-        # single ``content`` column, an unquoted colon query like ``TODO: fix``
-        # parses as ``column:term`` and raises "no such column" — swallowed at
-        # the execute site into zero results.  Strip it like the others.
-        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+        # Step 2: Strip remaining (unmatched) FTS5-special characters
+        sanitized = re.sub(r'[+{}()\"^]', " ", sanitized)
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)
@@ -2802,6 +2817,7 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
         sort: str = None,
+        user_id: str = None,
         include_inactive: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -2877,6 +2893,9 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            params.append(user_id)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -2952,6 +2971,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if user_id is not None:
+                    tri_where.append("s.user_id = ?")
+                    tri_params.append(user_id)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -3007,6 +3029,9 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                if user_id is not None:
+                    like_where.append("s.user_id = ?")
+                    like_params.append(user_id)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -3104,53 +3129,6 @@ class SessionDB:
 
         return matches
 
-    def search_sessions_by_id(
-        self,
-        query: str,
-        limit: int = 20,
-        include_archived: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """Search surfaced sessions by exact/prefix/substring session id.
-
-        Desktop search uses this alongside FTS message search so users can paste
-        a session id from logs, CLI output, or another Hermes surface and jump
-        straight to that conversation.  Matching also checks ``_lineage_root_id``
-        for projected compression-chain tips, so an old root id still resolves to
-        the live continuation row.
-        """
-        needle = (query or "").strip().lower()
-        if not needle or limit <= 0:
-            return []
-
-        # SQL-bounded: list_sessions_rich pushes the id LIKE filter into the
-        # query (matching the row's own id AND any id in its forward
-        # compression chain), so we only materialize matching rows instead of
-        # scanning every session. Fetch a small multiple of `limit` so the
-        # in-Python exact/prefix/substring ranking below has enough candidates
-        # to order, then truncate.
-        candidates = self.list_sessions_rich(
-            limit=max(limit * 4, limit),
-            offset=0,
-            include_archived=include_archived,
-            order_by_last_active=True,
-            id_query=needle,
-        )
-
-        def score(row: Dict[str, Any]) -> int:
-            ids = [str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")]
-            normalized = [value.lower() for value in ids if value]
-            if any(value == needle for value in normalized):
-                return 0
-            if any(value.startswith(needle) for value in normalized):
-                return 1
-            return 2
-
-        ranked = sorted(
-            enumerate(candidates),
-            key=lambda item: (score(item[1]), item[0]),
-        )
-        return [row for _, row in ranked[:limit]]
-
     def search_sessions(
         self,
         source: str = None,
@@ -3191,62 +3169,62 @@ class SessionDB:
     # Utility
     # =========================================================================
 
+    def session_source_counts(
+        self,
+        min_message_count: int = 0,
+        include_archived: bool = False,
+        archived_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Count sessions grouped by source for dashboard filtering."""
+        where_clauses = []
+        params = []
+        if min_message_count > 0:
+            where_clauses.append("message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where_clauses.append("archived = 1")
+        elif not include_archived:
+            where_clauses.append("archived = 0")
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                SELECT COALESCE(NULLIF(source, ''), 'local') AS source, COUNT(*) AS count
+                FROM sessions
+                {where_sql}
+                GROUP BY COALESCE(NULLIF(source, ''), 'local')
+                ORDER BY count DESC, source ASC
+                """,
+                params,
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
     def session_count(
         self,
         source: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
-        exclude_children: bool = False,
-        exclude_sources: List[str] = None,
     ) -> int:
-        """Count sessions, optionally filtered by source.
-
-        Pass ``exclude_children=True`` to count only the conversations that
-        ``list_sessions_rich`` surfaces (root + branch sessions), hiding
-        sub-agent runs and compression continuations. Use it whenever the count
-        is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
-        totals) so the total matches the number of listable rows — otherwise the
-        raw row count is inflated by children and "load more" never settles.
-
-        Pass ``exclude_sources`` to drop whole source classes from the count
-        (e.g. ``["cron"]`` so the recents "load more" total matches a
-        cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
-        stuck on for buried scheduler sessions).
-        """
+        """Count sessions, optionally filtered by source."""
         where_clauses = []
         params = []
 
-        if exclude_children:
-            # Mirror list_sessions_rich's child-exclusion clause exactly so the
-            # count lines up with the rows: roots (no parent) plus branch
-            # children (parent ended with end_reason='branched').
-            where_clauses.append(
-                "(s.parent_session_id IS NULL"
-                " OR EXISTS (SELECT 1 FROM sessions p"
-                "            WHERE p.id = s.parent_session_id"
-                "            AND p.end_reason = 'branched'"
-                "            AND s.started_at >= p.ended_at))"
-            )
         if source:
-            where_clauses.append("s.source = ?")
+            where_clauses.append("source = ?")
             params.append(source)
-        if exclude_sources:
-            placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
         if min_message_count > 0:
-            where_clauses.append("s.message_count >= ?")
+            where_clauses.append("message_count >= ?")
             params.append(min_message_count)
         if archived_only:
-            where_clauses.append("s.archived = 1")
+            where_clauses.append("archived = 1")
         elif not include_archived:
-            where_clauses.append("s.archived = 0")
+            where_clauses.append("archived = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         with self._lock:
-            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
+            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions{where_sql}", params)
             return cursor.fetchone()[0]
 
     def message_count(self, session_id: str = None) -> int:

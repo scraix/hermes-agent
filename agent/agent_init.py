@@ -271,6 +271,20 @@ def init_agent(
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
+    # Memory/session privacy scope. Ordinary shared group/channel chats must not
+    # load a sender's private built-in MEMORY/USER profile or allow session_search
+    # over the sender's private history. Personal workspace groups are verified
+    # DM-like windows and keep the authorized user's private scope while using a
+    # separate thread/window id for session separation.
+    _chat_type_lc = str(chat_type or "").lower()
+    agent._personal_workspace_memory_scope = _chat_type_lc == "personal_group"
+    agent._shared_chat_memory_scope = _chat_type_lc in {"group", "supergroup", "channel"}
+    if agent._personal_workspace_memory_scope:
+        agent._memory_namespace = f"{platform}:{user_id}" if platform and user_id else None
+    elif agent._shared_chat_memory_scope:
+        agent._memory_namespace = f"{platform}:group:{chat_id}" if platform and chat_id else None
+    else:
+        agent._memory_namespace = f"{platform}:{user_id}" if platform and user_id else None
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -405,7 +419,7 @@ def init_agent(
     agent.notice_clear_callback = notice_clear_callback
     agent.tool_gen_callback = tool_gen_callback
 
-    
+
     # Tool execution state — allows _vprint during tool execution
     # even when stream consumers are registered (no tokens streaming then)
     agent._executing_tools = False
@@ -438,12 +452,12 @@ def init_agent(
     # their tids explicitly.
     agent._tool_worker_threads: set[int] = set()
     agent._tool_worker_threads_lock = threading.Lock()
-    
+
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
-    
+
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
     agent.providers_ignored = providers_ignored
@@ -456,7 +470,7 @@ def init_agent(
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
-    
+
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
@@ -464,7 +478,7 @@ def init_agent(
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
-    
+
     # Anthropic prompt caching: auto-enabled for Claude models on native
     # Anthropic, OpenRouter, and third-party gateways that speak the
     # Anthropic protocol (``api_mode == 'anthropic_messages'``). Reduces
@@ -511,15 +525,6 @@ def init_agent(
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None
 
-    # Credits tracking (dev-only, L0 usage-aware-credits) — updated from
-    # x-nous-credits-* response headers after each API call.  Session-start
-    # remaining is latched the first time a header is ever seen so we can
-    # report cumulative micros spent.  Surfaced behind HERMES_DEV_CREDITS.
-    agent._credits_state = None
-    agent._credits_session_start_micros = None
-    # Threshold-notice latch (L4): active sticky-notice keys + the warn90 crossing gate.
-    agent._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
-
     # OpenRouter response cache hit counter — incremented when
     # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
     agent._or_cache_hits: int = 0
@@ -545,7 +550,7 @@ def init_agent(
         # console. Any future noise reduction belongs at the
         # handler level inside hermes_logging.py, not here.
         pass
-    
+
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
     agent._stream_callback = None
@@ -751,12 +756,24 @@ def init_agent(
                 # declare custom headers (e.g. Kimi User-Agent on non-kimi.com
                 # endpoints).
                 try:
-                    from providers import get_provider_profile as _gpf
-                    _ph = _gpf(agent.provider)
-                    if _ph and _ph.default_headers:
-                        client_kwargs["default_headers"] = dict(_ph.default_headers)
+                    from hermes_cli.config import load_config as _load_header_cfg
+                    _cfg = _load_header_cfg() or {}
+                    _provider_key = str(agent.provider or "").strip().lower()
+                    _provider_bare = _provider_key.split(":", 1)[1] if _provider_key.startswith("custom:") else _provider_key
+                    _effective_base = str(effective_base or "").strip().rstrip("/").lower()
+                    for _entry in (_cfg.get("custom_providers") or []):
+                        if not isinstance(_entry, dict):
+                            continue
+                        _entry_name = str(_entry.get("name") or "").strip().lower()
+                        _entry_slug = "custom:" + _entry_name.replace(" ", "-") if _entry_name else ""
+                        _entry_base = str(_entry.get("base_url") or _entry.get("url") or _entry.get("api") or "").strip().rstrip("/").lower()
+                        if _provider_key in {_entry_name, _entry_slug} or _provider_bare == _entry_name or (_effective_base and _effective_base == _entry_base):
+                            _headers = _entry.get("default_headers")
+                            if isinstance(_headers, dict) and _headers:
+                                client_kwargs["default_headers"] = dict(_headers)
+                            break
                 except Exception:
-                    pass
+                    logger.debug("Provider default_headers lookup failed for %s", agent.provider, exc_info=True)
         else:
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
@@ -846,7 +863,7 @@ def init_agent(
                         "select a provider, or run `hermes setup` for first-time "
                         "configuration."
                     )
-        
+
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
         # Enable fine-grained tool streaming for Claude on OpenRouter.
@@ -890,7 +907,7 @@ def init_agent(
                     print("⚠️  Warning: API key appears invalid or missing")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-    
+
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
@@ -922,7 +939,7 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
-    
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
@@ -955,16 +972,16 @@ def init_agent(
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:
             print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
-    
+
     # Show trajectory saving status
     if agent.save_trajectories and not agent.quiet_mode:
         print("📝 Trajectory saving enabled")
-    
+
     # Show ephemeral system prompt status
     if agent.ephemeral_system_prompt and not agent.quiet_mode:
         prompt_preview = agent.ephemeral_system_prompt[:60] + "..." if len(agent.ephemeral_system_prompt) > 60 else agent.ephemeral_system_prompt
         print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
-    
+
     # Show prompt caching status
     if agent._use_prompt_caching and not agent.quiet_mode:
         if agent._use_native_cache_layout and agent.provider == "anthropic":
@@ -974,7 +991,7 @@ def init_agent(
         else:
             source = "Claude via OpenRouter"
         print(f"💾 Prompt caching: ENABLED ({source}, {agent._cache_ttl} TTL)")
-    
+
     # Session logging setup - auto-save conversation trajectories for debugging
     agent.session_start = datetime.now()
     if session_id:
@@ -1014,7 +1031,7 @@ def init_agent(
         pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
-    
+
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible
@@ -1026,10 +1043,10 @@ def init_agent(
     agent._codex_reasoning_replay_enabled = True
     agent._memory_write_origin = "assistant_tool"
     agent._memory_write_context = "foreground"
-    
+
     # Cached system prompt -- built once per session, only rebuilt on compression
     agent._cached_system_prompt: Optional[str] = None
-    
+
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
     agent._checkpoint_mgr = CheckpointManager(
@@ -1038,7 +1055,7 @@ def init_agent(
         max_total_size_mb=checkpoint_max_total_size_mb,
         max_file_size_mb=checkpoint_max_file_size_mb,
     )
-    
+
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
@@ -1049,11 +1066,11 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
-    
+
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
-    
+
     # Load config once for memory, skills, and compression sections
     try:
         from hermes_cli.config import load_config as _load_agent_config
@@ -1080,7 +1097,7 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_memory and not agent._shared_chat_memory_scope:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1095,13 +1112,13 @@ def init_agent(
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
-    
+
 
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory and not agent._shared_chat_memory_scope:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
@@ -1566,7 +1583,7 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
-    
+
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.
     # When running against an Ollama server, detect the model's max context

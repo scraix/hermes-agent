@@ -11,6 +11,7 @@ import json
 import os
 import time
 import asyncio
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -757,3 +758,67 @@ class TestCmdUpdateGatewayMode:
         from types import SimpleNamespace
         args = SimpleNamespace(gateway=True)
         assert args.gateway is True
+
+    def test_local_post_update_patch_hook_runs_profile_installer(self, tmp_path, monkeypatch, capsys):
+        """A bare hermes update should re-apply a local patch overlay when present."""
+        from hermes_cli import main as cli_main
+
+        hermes_home = tmp_path / "home"
+        installer = hermes_home / "patches" / "install.sh"
+        installer.parent.mkdir(parents=True)
+        installer.write_text("#!/bin/sh\nexit 0\n")
+        installer.chmod(0o755)
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return _FakeCompleted()
+
+        monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path / "repo")
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+        monkeypatch.setitem(os.environ, "HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home",
+            lambda: Path(os.environ["HERMES_HOME"]),
+        )
+
+        cli_main._run_local_post_update_patch_hook()
+
+        assert calls
+        cmd, kwargs = calls[0]
+        assert cmd == ["bash", str(installer)]
+        assert kwargs["cwd"] == tmp_path / "repo"
+        assert kwargs["env"]["HERMES_HOME"] == str(tmp_path / "repo")
+        assert "Local patch overlay applied" in capsys.readouterr().out
+
+    def test_upstream_sync_resets_patch_fork_when_local_installer_exists(self, tmp_path, monkeypatch, capsys):
+        """Patch-stack forks should not require manual upstream reset after hermes update."""
+        from hermes_cli import main as cli_main
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _FakeCompleted()
+
+        monkeypatch.setattr(cli_main, "_has_upstream_remote", lambda *a: True)
+        monkeypatch.setattr(cli_main, "_count_commits_between", lambda _git, _cwd, base, head: 3 if base == "upstream/main" else 18)
+        monkeypatch.setattr(cli_main, "_local_post_update_patch_installer", lambda: tmp_path / "home" / "patches" / "install.sh")
+        monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+        cli_main._sync_with_upstream_if_needed(["git"], tmp_path / "repo")
+
+        assert ["git", "fetch", "upstream", "--quiet"] in calls
+        assert ["git", "reset", "--hard", "upstream/main"] in calls
+        out = capsys.readouterr().out
+        assert "Local patch installer detected" in out
+        assert "Synced working tree to upstream/main" in out

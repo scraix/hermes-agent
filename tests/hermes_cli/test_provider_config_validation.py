@@ -102,6 +102,21 @@ class TestNormalizeCustomProviderEntry:
         assert result is not None
         assert not any("unknown config keys" in r.message.lower() for r in caplog.records)
 
+    def test_anthropic_headers_not_flagged_unknown_and_preserved(self, caplog):
+        """Anthropic-compatible provider metadata should normalize without warnings."""
+        entry = {
+            "base_url": "https://api.example.com/v1",
+            "api_mode": "anthropic_messages",
+            "default_headers": {"X-Test-Header": "enabled"},
+            "anthropic_beta": "context-1m-2025-08-07",
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _normalize_custom_provider_entry(entry, provider_key="claude-relay")
+        assert result is not None
+        assert result["default_headers"] == {"X-Test-Header": "enabled"}
+        assert result["anthropic_beta"] == "context-1m-2025-08-07"
+        assert not any("unknown config keys" in r.message.lower() for r in caplog.records)
+
     def test_camel_case_warning_logged(self, caplog):
         """camelCase alias mapping should produce a warning."""
         entry = {

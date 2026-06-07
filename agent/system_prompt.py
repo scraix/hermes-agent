@@ -36,7 +36,6 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
-    STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -131,11 +130,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
-
-    # Steering only lands inside tool results, so it's only reachable when the
-    # agent has tools. Static text → byte-stable prompt (no cache hit).
-    if agent.valid_tool_names:
-        stable_parts.append(STEER_CHANNEL_NOTE)
 
     # Computer-use (macOS) — goes in as its own block rather than being
     # merged into tool_guidance because the content is multi-paragraph.
@@ -316,6 +310,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+
+    # Memory index/manifest — table of contents for durable memory.
+    # It tells the agent what can be retrieved without making the manifest
+    # itself the source of truth.  Exact facts still come from memory tools.
+    try:
+        _hermes_home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        _manifest_path = os.path.join(_hermes_home, "memories", "MEMORY_MANIFEST.md")
+        if os.path.isfile(_manifest_path):
+            with open(_manifest_path, "r", encoding="utf-8") as _mf:
+                _manifest_text = _mf.read().strip()
+            if _manifest_text:
+                volatile_parts.append(
+                    "# Memory Index (inventory of what you have stored — "
+                    "use the memory/hindsight tools to fetch these instead of guessing)\n"
+                    + _manifest_text
+                )
+    except Exception:
+        pass
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:

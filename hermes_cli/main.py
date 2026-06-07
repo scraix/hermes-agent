@@ -8648,8 +8648,36 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, the conservative upstream
+    # default is to avoid trampling a user's fork work.  Local patch-stack
+    # installs are different: the fork is expected to contain generated/local
+    # patch commits, while ``~/.hermes/patches/install.sh`` is the durable
+    # source of truth that will be re-run after update.  In that case, sync the
+    # working tree to upstream/main and let the post-update patch hook reapply
+    # overlays/targeted patches so `hermes update` remains the only command the
+    # maintainer needs to run.
     if origin_ahead > 0:
+        if _local_post_update_patch_installer() is not None and upstream_ahead > 0:
+            print()
+            print(
+                f"ℹ Fork has {origin_ahead} local patch commit(s) and "
+                f"upstream has {upstream_ahead} new commit(s)."
+            )
+            print("  Local patch installer detected; syncing to upstream/main before reapplying patches.")
+            reset_result = subprocess.run(
+                git_cmd + ["reset", "--hard", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if reset_result.returncode != 0:
+                print("  ✗ Failed to reset to upstream/main. Skipping upstream sync.")
+                if reset_result.stderr.strip():
+                    print(f"    {reset_result.stderr.strip().splitlines()[0]}")
+                return
+            print("  ✓ Synced working tree to upstream/main; local patch hook will reapply overlays")
+            return
+
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")
@@ -10128,6 +10156,54 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def _local_post_update_patch_installer() -> Path | None:
+    """Return the local patch installer path when this profile has one."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    except Exception:
+        hermes_home = Path.home() / ".hermes"
+
+    installer = hermes_home / "patches" / "install.sh"
+    return installer if installer.exists() else None
+
+
+def _run_local_post_update_patch_hook() -> None:
+    """Run a local Hermes patch installer after a successful source update.
+
+    This is intentionally opt-in by presence: upstream users without
+    ``~/.hermes/patches/install.sh`` see no behavior change. Patch-stack
+    maintainers can keep ``hermes update`` as the only command they need to
+    remember; the local installer remains the source of truth for overlay
+    files, targeted patches, bytecode cleanup, and smoke checks.
+    """
+    installer = _local_post_update_patch_installer()
+    if installer is None:
+        return
+    if not os.access(installer, os.X_OK):
+        print()
+        print(f"  ⚠ Local patch installer exists but is not executable: {installer}")
+        print("    Run manually: bash ~/.hermes/patches/install.sh")
+        return
+
+    print()
+    print("→ Applying local Hermes patch overlay...")
+    env = {**os.environ, "HERMES_HOME": str(PROJECT_ROOT)}
+    result = subprocess.run(
+        ["bash", str(installer)],
+        cwd=PROJECT_ROOT,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        print("✗ Local patch installer failed.")
+        print("  Your upstream update completed, but custom patches were not reapplied.")
+        print(f"  Retry manually: HERMES_HOME={PROJECT_ROOT} bash {installer}")
+        sys.exit(result.returncode)
+    print("  ✓ Local patch overlay applied")
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -10505,9 +10581,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if commit_count == 0:
             _invalidate_update_cache()
 
-            # Even if origin is up to date, the fork may be behind upstream
+            # Even if origin is up to date, the fork may be behind upstream.
+            # If a local patch installer is configured, this may reset the
+            # worktree to upstream/main; immediately run the post-update hook
+            # before returning so `hermes update` remains one command.
             if is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+                _run_local_post_update_patch_hook()
 
             # Restore stash and switch back to original branch if we moved
             if auto_stash_ref is not None:

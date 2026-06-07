@@ -474,21 +474,6 @@ def _try_resolve_from_custom_pool(
         return None
 
 
-def _lift_max_output_tokens(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
-    """Propagate a per-provider output cap onto the resolved runtime dict.
-
-    Accepts ``max_output_tokens`` or ``max_tokens`` on a ``custom_providers``
-    entry so a provider block can pin its own output limit. Gateway and CLI
-    map this onto ``AIAgent.max_tokens`` only when the top-level
-    ``model.max_tokens`` isn't set, so the documented global key still wins.
-    """
-    for _k in ("max_output_tokens", "max_tokens"):
-        _v = entry.get(_k)
-        if isinstance(_v, int) and _v > 0:
-            result["max_output_tokens"] = _v
-            return
-
-
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm or requested_norm == "custom":
@@ -517,7 +502,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 return None
 
     config = load_config()
-    
+
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -546,6 +531,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
+                    default_headers = entry.get("default_headers")
+                    if isinstance(default_headers, dict):
+                        result["default_headers"] = dict(default_headers)
                     # The v11→v12 migration writes the API mode under the new
                     # ``transport`` field, but hand-edited configs may still
                     # use the legacy ``api_mode`` spelling.  Accept both —
@@ -556,7 +544,6 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                     if api_mode:
                         result["api_mode"] = api_mode
-                    _lift_max_output_tokens(entry, result)
                     return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -575,10 +562,12 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         extra_body = entry.get("extra_body")
                         if isinstance(extra_body, dict):
                             result["extra_body"] = dict(extra_body)
+                        default_headers = entry.get("default_headers")
+                        if isinstance(default_headers, dict):
+                            result["default_headers"] = dict(default_headers)
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode
-                        _lift_max_output_tokens(entry, result)
                         return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -622,13 +611,15 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
+        default_headers = entry.get("default_headers")
+        if isinstance(default_headers, dict):
+            result["default_headers"] = dict(default_headers)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:
             result["model"] = model_name
-        _lift_max_output_tokens(entry, result)
         return result
 
     return None
@@ -717,8 +708,6 @@ def _resolve_named_custom_runtime(
         model_name = custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
-        if isinstance(custom_provider.get("max_output_tokens"), int):
-            pool_result["max_output_tokens"] = custom_provider["max_output_tokens"]
         request_overrides = _custom_provider_request_overrides(custom_provider)
         if request_overrides:
             pool_result["request_overrides"] = {
@@ -756,8 +745,6 @@ def _resolve_named_custom_runtime(
     # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
-    if isinstance(custom_provider.get("max_output_tokens"), int):
-        result["max_output_tokens"] = custom_provider["max_output_tokens"]
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides

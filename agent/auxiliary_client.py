@@ -265,6 +265,9 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
     "gmi": "google/gemini-3.1-flash-lite-preview",
+    "minimax": "MiniMax-M2.7",
+    "minimax-oauth": "MiniMax-M2.7-highspeed",
+    "minimax-cn": "MiniMax-M2.7",
     "anthropic": "claude-haiku-4-5-20251001",
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
@@ -1817,6 +1820,33 @@ def _current_custom_base_url() -> str:
     return custom_base or ""
 
 
+def _custom_provider_default_headers(*, provider: str = "", base_url: str = "") -> Dict[str, str]:
+    """Return default_headers from matching config.yaml custom provider entry.
+
+    Some custom relays require client-level headers such as a curl-like
+    User-Agent. These headers are deployment config, not hostname-specific
+    code, so preserve them for both main/provider-only and auxiliary paths.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return {}
+    provider_key = str(provider or "").strip().lower()
+    provider_bare = provider_key.split(":", 1)[1] if provider_key.startswith("custom:") else provider_key
+    effective_base = str(base_url or "").strip().rstrip("/").lower()
+    for entry in (cfg.get("custom_providers") or []):
+        if not isinstance(entry, dict):
+            continue
+        entry_name = str(entry.get("name") or "").strip().lower()
+        entry_slug = "custom:" + entry_name.replace(" ", "-") if entry_name else ""
+        entry_base = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip().rstrip("/").lower()
+        if provider_key in {entry_name, entry_slug} or provider_bare == entry_name or (effective_base and effective_base == entry_base):
+            headers = entry.get("default_headers")
+            return dict(headers) if isinstance(headers, dict) else {}
+    return {}
+
+
 def _validate_proxy_env_urls() -> None:
     """Fail fast with a clear error when proxy env vars have malformed URLs.
 
@@ -1879,6 +1909,9 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
+    _headers = _custom_provider_default_headers(provider=_read_main_provider(), base_url=custom_base)
+    if _headers:
+        _extra["default_headers"] = _headers
     if custom_mode == "codex_responses":
         real_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
         return CodexAuxiliaryClient(real_client, model), model
@@ -3526,15 +3559,9 @@ def resolve_provider_client(
             elif base_url_host_matches(custom_base, "integrate.api.nvidia.com"):
                 extra["default_headers"] = build_nvidia_nim_headers(custom_base)
             else:
-                # Fall back to profile.default_headers for providers that
-                # declare client-level attribution headers on their profile.
-                try:
-                    from providers import get_provider_profile as _gpf_custom
-                    _ph_custom = _gpf_custom(provider)
-                    if _ph_custom and _ph_custom.default_headers:
-                        extra["default_headers"] = dict(_ph_custom.default_headers)
-                except Exception:
-                    pass
+                headers = _custom_provider_default_headers(provider=provider, base_url=custom_base)
+                if headers:
+                    extra["default_headers"] = headers
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -3611,6 +3638,9 @@ def resolve_provider_client(
                     raw_base_for_wrap = custom_base
                 _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
+                _entry_headers = custom_entry.get("default_headers")
+                if isinstance(_entry_headers, dict) and _entry_headers:
+                    _extra2["default_headers"] = dict(_entry_headers)
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
                     provider, final_model, entry_api_mode or "chat_completions")
@@ -3633,6 +3663,9 @@ def resolve_provider_client(
                         _fallback_base = _to_openai_base_url(custom_base)
                         _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
                         _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
+                        _fb_headers = custom_entry.get("default_headers")
+                        if isinstance(_fb_headers, dict) and _fb_headers:
+                            _fb_extra["default_headers"] = dict(_fb_headers)
                         client = OpenAI(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
                         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                                 else (client, final_model))
@@ -4211,7 +4244,7 @@ def resolve_vision_provider_client(
 
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. Returns empty dict otherwise.
     """
@@ -4220,7 +4253,7 @@ def get_auxiliary_extra_body() -> dict:
 
 def auxiliary_max_tokens_param(value: int) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
-    
+
     OpenRouter and local models use 'max_tokens'. Direct OpenAI with newer
     models (gpt-4o, o-series, gpt-5+) requires 'max_completion_tokens'.
     The Codex adapter translates max_tokens internally, so we use max_tokens
@@ -4753,14 +4786,10 @@ def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
 
 
 def _convert_openai_images_to_anthropic(messages: list) -> list:
-    """Convert OpenAI ``image_url``/``video_url`` blocks to Anthropic format.
+    """Convert OpenAI ``image_url`` content blocks to Anthropic ``image`` blocks.
 
-    Converts:
-    - ``image_url`` blocks to Anthropic ``image`` blocks
-    - ``video_url`` blocks to Anthropic ``video`` blocks (MiniMax M3 compat)
-
-    Only touches messages that have list-type content with ``image_url`` or
-    ``video_url`` blocks; plain text messages pass through unchanged.
+    Only touches messages that have list-type content with ``image_url`` blocks;
+    plain text messages pass through unchanged.
     """
     converted = []
     for msg in messages:
@@ -4794,39 +4823,6 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
                         "source": {
                             "type": "url",
                             "url": image_url_val,
-                        },
-                    })
-                changed = True
-            elif block.get("type") == "video_url":
-                # MiniMax's Anthropic-compatible endpoint expects a "video"
-                # block (not OpenAI's "video_url", and not "input_video").
-                # See https://platform.minimax.io/docs/api-reference/text-anthropic-api
-                # — the Messages-field table lists type="video" (M3 only,
-                # URL/base64/mm_file://). The source shape mirrors the "image"
-                # block: base64 → {type:"base64", media_type, data}, URL →
-                # {type:"url", url}.
-                video_url_val = (block.get("video_url") or {}).get("url", "")
-                if video_url_val.startswith("data:"):
-                    # Parse data URI: data:<media_type>;base64,<data>
-                    header, _, b64data = video_url_val.partition(",")
-                    media_type = "video/mp4"
-                    if ":" in header and ";" in header:
-                        media_type = header.split(":", 1)[1].split(";", 1)[0]
-                    new_content.append({
-                        "type": "video",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64data,
-                        },
-                    })
-                else:
-                    # URL-based video
-                    new_content.append({
-                        "type": "video",
-                        "source": {
-                            "type": "url",
-                            "url": video_url_val,
                         },
                     })
                 changed = True

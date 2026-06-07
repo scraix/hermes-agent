@@ -66,11 +66,88 @@ from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     fal_key_is_configured,
     managed_nous_tools_enabled,
-    nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _probe_image_generation_capability() -> Dict[str, Any]:
+    """Return a provider-aware capability snapshot for image generation.
+
+    This is the single source of truth for answering which image backend is
+    configured, whether it is registered, whether it is currently available,
+    and at which layer capability resolution failed.
+    """
+    configured_provider = _read_configured_image_provider()
+    configured_model = _read_configured_image_model()
+
+    snapshot: Dict[str, Any] = {
+        "configured_provider": configured_provider,
+        "configured_model": configured_model,
+        "active_provider": None,
+        "provider_registered": False,
+        "provider_available": False,
+        "fal_available": False,
+        "managed_fal_gateway": False,
+        "available": False,
+        "failure_layer": None,
+        "detail": None,
+    }
+
+    managed_gateway = _resolve_managed_fal_gateway()
+    fal_available = bool(check_fal_api_key())
+    snapshot["fal_available"] = fal_available
+    snapshot["managed_fal_gateway"] = bool(managed_gateway)
+
+    provider = None
+    if configured_provider:
+        try:
+            from agent.image_gen_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider = get_provider(configured_provider)
+        except Exception as exc:
+            snapshot["failure_layer"] = "provider_discovery"
+            snapshot["detail"] = str(exc)
+            return snapshot
+
+        if provider is None:
+            snapshot["failure_layer"] = "provider_not_registered"
+            snapshot["detail"] = (
+                f"Configured image_gen.provider '{configured_provider}' is not registered"
+            )
+            return snapshot
+
+        snapshot["provider_registered"] = True
+        snapshot["active_provider"] = getattr(provider, "name", None)
+        try:
+            available = bool(provider.is_available())
+        except Exception as exc:
+            snapshot["failure_layer"] = "provider_availability_check"
+            snapshot["detail"] = str(exc)
+            return snapshot
+
+        snapshot["provider_available"] = available
+        snapshot["available"] = available
+        if available:
+            return snapshot
+
+        snapshot["failure_layer"] = "provider_unavailable"
+        snapshot["detail"] = (
+            f"Configured image_gen.provider '{configured_provider}' is registered but unavailable"
+        )
+        return snapshot
+
+    snapshot["available"] = fal_available
+    if fal_available:
+        snapshot["active_provider"] = "fal"
+        return snapshot
+
+    snapshot["failure_layer"] = "no_backend_configured"
+    snapshot["detail"] = "No configured provider is available and FAL fallback is unavailable"
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +399,7 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
     # fal (2026-05-27). Same model family as our direct ``plugins/image_gen/krea``
     # backend, exposed here for users who prefer to bill through their
     # existing FAL key / Nous Portal subscription rather than register
-    # directly with Krea.  Both variants share the same parameter schema —
+    # directly with Krea. Both variants share the same parameter schema —
     # only model id, price, and recommended use case differ.
     "fal-ai/krea/v2/medium/text-to-image": {
         "display": "Krea 2 Medium",
@@ -330,8 +407,6 @@ FAL_MODELS: Dict[str, Dict[str, Any]] = {
         "strengths": "Illustration, anime, painting, expressive/artistic styles",
         "price": "$0.030 (text) / $0.035 (style refs)",
         "size_style": "aspect_ratio",
-        # Krea natively accepts 1:1, 4:3, 3:2, 16:9, 2.35:1, 4:5, 2:3, 9:16 —
-        # we map our 3 abstract ratios to the closest match.
         "sizes": {
             "landscape": "16:9",
             "square": "1:1",
@@ -453,22 +528,12 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
         # of a raw HTTP error from httpx.
         status = _extract_http_status(exc)
         if status is not None and 400 <= status < 500:
-            gateway_message = ""
-            if status in {401, 402, 403}:
-                gateway_message = (
-                    "\n\n"
-                    + nous_tool_gateway_unavailable_message(
-                        "managed FAL image generation",
-                        force_fresh=True,
-                    )
-                )
             raise ValueError(
                 f"Nous Subscription gateway rejected model '{model}' "
                 f"(HTTP {status}). This model may not yet be enabled on "
                 f"the Nous Portal's FAL proxy. Either:\n"
                 f"  • Set FAL_KEY in your environment to use FAL.ai directly, or\n"
                 f"  • Pick a different model via `hermes tools` → Image Generation."
-                f"{gateway_message}"
             ) from exc
         raise
 
@@ -606,121 +671,6 @@ def _upscale_image(image_url: str, original_prompt: str) -> Optional[Dict[str, A
 # ---------------------------------------------------------------------------
 # Tool entry point
 # ---------------------------------------------------------------------------
-def _looks_like_absolute_file_path(value: str) -> bool:
-    if not value or not isinstance(value, str):
-        return False
-    lower = value.lower()
-    if lower.startswith(("http://", "https://", "data:")):
-        return False
-    if os.path.isabs(value):
-        return True
-    return len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
-
-
-def _active_terminal_env(task_id: str | None):
-    try:
-        from tools.terminal_tool import get_active_env
-
-        return get_active_env(task_id or "default")
-    except Exception as exc:  # noqa: BLE001 - artifact hinting must not break generation
-        logger.debug("Could not inspect active terminal environment: %s", exc)
-        return None
-
-
-def _agent_cache_base_for_env(env: Any) -> str | None:
-    if env is not None:
-        # Forward-looking optional override: an environment may expose its own
-        # agent-visible cache root via this callable. No backend defines it yet
-        # — it's an extension hook, not a typo. The getattr/callable guards make
-        # it a safe no-op until a producer exists.
-        explicit = getattr(env, "agent_visible_cache_base", None)
-        if callable(explicit):
-            try:
-                value = explicit()
-                if value:
-                    return str(value).rstrip("/")
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("active env agent_visible_cache_base failed: %s", exc)
-
-        remote_home = getattr(env, "_remote_home", None)
-        if remote_home:
-            return f"{str(remote_home).rstrip('/')}/.hermes"
-
-        env_name = env.__class__.__name__
-        if env_name in {"DockerEnvironment", "SingularityEnvironment", "ModalEnvironment"}:
-            return "/root/.hermes"
-
-    # If no environment has been created yet, only backends with deterministic
-    # Hermes cache roots can be translated without side effects. SSH can still
-    # use a shell-visible tilde path; its first environment sync will upload
-    # the cache file before the first command runs.
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
-    if backend in {"docker", "singularity", "modal"}:
-        return "/root/.hermes"
-    if backend == "ssh":
-        return "~/.hermes"
-    return None
-
-
-def _agent_visible_cache_path(host_path: str, env: Any) -> str | None:
-    if not _looks_like_absolute_file_path(host_path):
-        return None
-
-    cache_base = _agent_cache_base_for_env(env)
-    if not cache_base:
-        return None
-
-    try:
-        from tools.credential_files import map_cache_path_to_container
-
-        return map_cache_path_to_container(host_path, container_base=cache_base)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Could not translate image cache path for backend: %s", exc)
-    return None
-
-
-def _force_artifact_sync(env: Any) -> None:
-    sync_manager = getattr(env, "_sync_manager", None)
-    if sync_manager is None:
-        return
-    try:
-        sync_manager.sync(force=True)
-    except Exception as exc:  # noqa: BLE001 - keep generation success; log for operators
-        logger.warning("Could not force-sync generated image artifact: %s", exc)
-
-
-def _postprocess_image_generate_result(raw: str, task_id: str | None = None) -> str:
-    """Annotate successful local image results with backend-visible paths.
-
-    ``image`` remains the host/gateway-deliverable path.  When the active
-    terminal backend has a different filesystem, ``agent_visible_image`` gives
-    the path the agent can use with terminal/file tools.
-    """
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return raw
-
-    if not isinstance(payload, dict) or not payload.get("success"):
-        return raw
-
-    image = payload.get("image")
-    if not isinstance(image, str) or not _looks_like_absolute_file_path(image):
-        return raw
-
-    env = _active_terminal_env(task_id)
-    agent_path = _agent_visible_cache_path(image, env)
-    if not agent_path or agent_path == image:
-        return raw
-
-    if env is not None:
-        _force_artifact_sync(env)
-
-    payload.setdefault("host_image", image)
-    payload.setdefault("agent_visible_image", agent_path)
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def image_generate_tool(
     prompt: str,
     aspect_ratio: str = DEFAULT_ASPECT_RATIO,
@@ -877,27 +827,52 @@ def check_fal_api_key() -> bool:
 
 
 def _build_no_backend_setup_message() -> str:
-    """Build an actionable error string when no FAL backend is reachable.
+    """Build an actionable error string when no image-gen backend is reachable.
 
-    Used by the in-tree FAL path. Mentions:
-      - FAL_KEY signup link
-      - managed-gateway status (if Nous tools are enabled)
-      - plugin alternative pointer (so users on a stale ``image_gen.provider``
-        know the registry exists and how to inspect it)
+    This must reflect the *actual configured image-generation route*, not just
+    the historical in-tree FAL path. Otherwise agents can incorrectly tell the
+    user that image generation is unavailable when a plugin backend (for
+    example OpenAI) is configured and healthy.
     """
     lines = ["Image generation is unavailable in this environment.", ""]
     lines.append("Missing requirements:")
+
+    probe = _probe_image_generation_capability()
+    configured_provider = probe.get("configured_provider")
+    configured_model = probe.get("configured_model")
+
+    if configured_provider and configured_provider != "fal":
+        lines.append(
+            f"  - Configured image_gen.provider '{configured_provider}' is not currently available"
+        )
+        if probe.get("failure_layer"):
+            lines.append(f"  - Failure layer: {probe['failure_layer']}")
+        lines.append("")
+        lines.append("To restore image generation, check:")
+        lines.append(
+            "  1. `hermes tools` → Image Generation: confirm the selected provider and model"
+        )
+        lines.append(
+            "  2. `hermes plugins list`: verify that the configured image backend is installed/registered"
+        )
+        lines.append(
+            "  3. Provider credentials / endpoint config (for example OPENAI_API_KEY / OPENAI_BASE_URL for OpenAI-compatible routes)"
+        )
+        if configured_model:
+            lines.append(
+                f"  4. Confirm the configured model '{configured_model}' is supported by that provider"
+            )
+        lines.append(
+            "  5. If the selected provider is broken, switch providers via `hermes tools` instead of assuming FAL is the active route"
+        )
+        return "\n".join(lines)
+
     if managed_nous_tools_enabled():
         lines.append(
             "  - FAL_KEY is not set and the managed FAL gateway is unreachable"
         )
     else:
         lines.append("  - FAL_KEY environment variable is not set")
-        gateway_message = nous_tool_gateway_unavailable_message(
-            "managed FAL image generation",
-        )
-        if gateway_message:
-            lines.append(f"  - {gateway_message}")
     lines.append("")
     lines.append("To enable image generation, do one of:")
     lines.append(
@@ -920,16 +895,14 @@ def _build_no_backend_setup_message() -> str:
 def check_image_generation_requirements() -> bool:
     """True if any image gen backend is available.
 
-    Providers are considered in this order:
-
-    1. The in-tree FAL backend (FAL_KEY or managed gateway).
-    2. Any plugin-registered provider whose ``is_available()`` returns True.
-
-    Plugins win only when the in-tree FAL path is NOT ready, which matches
-    the historical behavior: shipping hermes with a FAL key configured
-    should still expose the tool. The active selection among ready
-    providers is resolved per-call by ``image_gen.provider``.
+    Prefers the explicitly configured provider when one is set. This prevents
+    capability checks from silently falling back to a different backend and
+    then giving the user the wrong diagnosis about which route actually failed.
     """
+    probe = _probe_image_generation_capability()
+    if probe.get("configured_provider") and probe.get("configured_provider") != "fal":
+        return bool(probe.get("available"))
+
     try:
         if check_fal_api_key():
             # Trigger the lazy fal_client import here as the SDK presence
@@ -1006,10 +979,7 @@ IMAGE_GENERATE_SCHEMA = {
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
-        "![description](url-or-path) and the gateway will deliver it. When "
-        "the active terminal backend has a different filesystem, successful "
-        "local-file results may also include `agent_visible_image` for "
-        "follow-up terminal/file operations."
+        "![description](url-or-path) and the gateway will deliver it."
     ),
     "parameters": {
         "type": "object",
@@ -1026,6 +996,22 @@ IMAGE_GENERATE_SCHEMA = {
             },
         },
         "required": ["prompt"],
+    },
+}
+
+
+IMAGE_CAPABILITY_DIAGNOSE_SCHEMA = {
+    "name": "image_capability_diagnose",
+    "description": (
+        "Diagnose the currently configured image-generation route and return a "
+        "provider-aware capability snapshot. Use this before declaring image "
+        "generation unavailable: it reports the configured provider/model, "
+        "whether the provider is registered and available, whether FAL fallback "
+        "is available, and the failure layer if capability resolution failed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
     },
 }
 
@@ -1069,7 +1055,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, *, image_path: Optional[str] = None, mask_path: Optional[str] = None, mode: str = "generate"):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -1126,7 +1112,16 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
         kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
         if configured_model:
             kwargs["model"] = configured_model
-        result = provider.generate(**kwargs)
+        if mode == "edit":
+            result = provider.edit(
+                prompt=prompt,
+                image_path=image_path or "",
+                aspect_ratio=aspect_ratio,
+                mask_path=mask_path,
+                **({"model": configured_model} if configured_model else {}),
+            )
+        else:
+            result = provider.generate(**kwargs)
     except Exception as exc:
         logger.warning(
             "Image gen provider '%s' raised: %s",
@@ -1153,19 +1148,84 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
-    task_id = kw.get("task_id")
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
     dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
     if dispatched is not None:
-        return _postprocess_image_generate_result(dispatched, task_id=task_id)
+        return dispatched
 
-    raw = image_generate_tool(
+    return image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
     )
-    return _postprocess_image_generate_result(raw, task_id=task_id)
+
+
+def _handle_image_capability_diagnose(args, **kw):
+    return json.dumps(_probe_image_generation_capability(), ensure_ascii=False)
+
+
+IMAGE_EDIT_SCHEMA = {
+    "name": "image_edit",
+    "description": (
+        "Edit an existing image using the configured image backend. This is true "
+        "image-to-image / inpainting when the provider supports it: the input "
+        "image file is uploaded to the image edit endpoint rather than being "
+        "converted to a text description. Returns a URL or absolute file path "
+        "in the `image` field."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Instructions for how to edit the input image. Be explicit about what to preserve and what to change.",
+            },
+            "image_path": {
+                "type": "string",
+                "description": "Absolute or relative local path to the input image to edit.",
+            },
+            "mask_path": {
+                "type": "string",
+                "description": "Optional local path to an inpainting mask image. Transparent/marked areas are edited according to backend semantics.",
+            },
+            "aspect_ratio": {
+                "type": "string",
+                "enum": list(VALID_ASPECT_RATIOS),
+                "description": "Desired output aspect ratio: landscape, square, or portrait.",
+                "default": DEFAULT_ASPECT_RATIO,
+            },
+        },
+        "required": ["prompt", "image_path"],
+    },
+}
+
+
+def _handle_image_edit(args, **kw):
+    prompt = args.get("prompt", "")
+    if not prompt:
+        return tool_error("prompt is required for image editing")
+    image_path = args.get("image_path", "")
+    if not image_path:
+        return tool_error("image_path is required for image editing")
+    aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    mask_path = args.get("mask_path") or None
+    dispatched = _dispatch_to_plugin_provider(
+        prompt,
+        aspect_ratio,
+        image_path=image_path,
+        mask_path=mask_path,
+        mode="edit",
+    )
+    if dispatched is not None:
+        return dispatched
+    return json.dumps({
+        "success": False,
+        "image": None,
+        "error": "No configured image_gen provider supports image editing. Configure image_gen.provider (for example 'openai').",
+        "error_type": "provider_not_configured",
+    })
+
 
 
 registry.register(
@@ -1177,4 +1237,26 @@ registry.register(
     requires_env=[],
     is_async=False,   # sync fal_client API to avoid "Event loop is closed" in gateway
     emoji="🎨",
+)
+
+registry.register(
+    name="image_edit",
+    toolset="image_gen",
+    schema=IMAGE_EDIT_SCHEMA,
+    handler=_handle_image_edit,
+    check_fn=check_image_generation_requirements,
+    requires_env=[],
+    is_async=False,
+    emoji="🖼️",
+)
+
+registry.register(
+    name="image_capability_diagnose",
+    toolset="image_gen",
+    schema=IMAGE_CAPABILITY_DIAGNOSE_SCHEMA,
+    handler=_handle_image_capability_diagnose,
+    check_fn=lambda: True,
+    requires_env=[],
+    is_async=False,
+    emoji="🩺",
 )

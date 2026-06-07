@@ -384,6 +384,24 @@ class TestDMTopicFallbackReplyToMode:
         )
         assert result == {"message_thread_id": 42}
 
+    def test_personal_workspace_group_window_marker_is_not_sent_as_topic_id(self):
+        """Personal-workspace group markers are Hermes session lanes, not Telegram topic ids."""
+        assert TelegramAdapter._message_thread_id_for_send("group:workspace-chat") is None
+        assert TelegramAdapter._message_thread_id_for_typing("group:workspace-chat") is None
+        assert TelegramAdapter._thread_kwargs_for_send(
+            "owner-user", "group:workspace-chat", None,
+            reply_to_message_id=None,
+        ) == {"message_thread_id": None}
+
+    def test_personal_workspace_group_topic_marker_keeps_real_topic_id(self):
+        """If a personal workspace uses a forum topic, only the topic suffix goes to Telegram."""
+        assert TelegramAdapter._message_thread_id_for_send("group:workspace-chat:17585") == 17585
+        assert TelegramAdapter._message_thread_id_for_typing("group:workspace-chat:17585") == 17585
+        assert TelegramAdapter._thread_kwargs_for_send(
+            "owner-user", "group:workspace-chat:17585", None,
+            reply_to_message_id=None,
+        ) == {"message_thread_id": 17585}
+
     # -- send() integration test --
 
     @pytest.mark.asyncio

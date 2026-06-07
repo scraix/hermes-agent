@@ -579,15 +579,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall controls
         self._auto_recall = True
         self._recall_max_tokens = 4096
-        # Default to observation-only recall. Observations are Hindsight's
-        # consolidated knowledge layer — deduplicated, evidence-grounded
-        # beliefs built from many raw facts, with proof counts and
-        # freshness signals (see hindsight.vectorize.io/developer/observations).
-        # Including raw world/experience facts re-ships the supporting
-        # evidence that observations already summarize, burning the
-        # `recall_max_tokens` budget. Users can restore the broader
-        # recall via the `recall_types` config key.
-        self._recall_types: list[str] = ["observation"]
+        self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -633,18 +625,17 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 pass
         existing.update(values)
-        from utils import atomic_json_write
-        atomic_json_write(config_path, existing, mode=0o600)
+        config_path.write_text(json.dumps(existing, indent=2))
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
+        import getpass
         import subprocess
         import shutil
         import sys
         from pathlib import Path
 
         from hermes_cli.config import save_config
-        from hermes_cli.secret_prompt import masked_secret_prompt
 
         from hermes_cli.memory_setup import _curses_select
 
@@ -705,11 +696,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 masked = f"...{existing_key[-4:]}" if len(existing_key) > 4 else "set"
                 sys.stdout.write(f"  API key (current: {masked}, blank to keep): ")
                 sys.stdout.flush()
-                api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             else:
                 sys.stdout.write("  API key: ")
                 sys.stdout.flush()
-                api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if api_key:
                 env_writes["HINDSIGHT_API_KEY"] = api_key
 
@@ -723,7 +714,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
             sys.stdout.write("  API key (optional, blank to skip): ")
             sys.stdout.flush()
-            api_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+            api_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if api_key:
                 env_writes["HINDSIGHT_API_KEY"] = api_key
 
@@ -759,7 +750,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
             sys.stdout.write("  LLM API key: ")
             sys.stdout.flush()
-            llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+            llm_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             if llm_key:
                 env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
             else:
@@ -865,7 +856,6 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
-            {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
@@ -1197,17 +1187,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
-        # Default narrows recall to observation-only; pass an explicit
-        # `recall_types` list in config.json to broaden (e.g. include
-        # "world" / "experience") or to disable the filter entirely.
-        configured_types = self._config.get("recall_types")
-        if configured_types is None:
-            self._recall_types = ["observation"]
-        elif isinstance(configured_types, str):
-            # Allow comma-separated strings for parity with recall_tags.
-            self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
-        else:
-            self._recall_types = list(configured_types) or ["observation"]
+        self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
@@ -1448,6 +1428,15 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("sync_turn: skipped (shutting down)")
             return
 
+        # Skip retain for platforms whose messages cannot be attributed to
+        # real users (e.g. iLink WeChat bot reports all messages as bot's own
+        # from_user_id).  Set HINDSIGHT_SKIP_PLATFORMS="weixin,other" to
+        # extend; set to "" to disable the gate entirely.
+        _skip = os.environ.get("HINDSIGHT_SKIP_PLATFORMS", "weixin")
+        if _skip and self._platform in {p.strip() for p in _skip.split(",") if p.strip()}:
+            logger.debug("sync_turn: skipped (platform %s in HINDSIGHT_SKIP_PLATFORMS)", self._platform)
+            return
+
         if session_id:
             self._session_id = str(session_id).strip()
 
@@ -1510,6 +1499,119 @@ class HindsightMemoryProvider(MemoryProvider):
         self._register_atexit()
         self._retain_queue.put(_do_retain)
 
+    def _hindsight_text_fallback(self, query: str, limit: int = 5) -> str:
+        """Fallback recall when the embedding provider is unavailable.
+
+        Hindsight's normal recall needs a fresh query embedding. If the embedding
+        provider is out of balance or otherwise unavailable, returning a hard
+        tool error makes the agent effectively amnesic even though the local
+        PostgreSQL memory store still contains useful text. This fallback uses
+        PostgreSQL full-text + ILIKE over memory_units.text, scoped to the active
+        bank, and clearly marks the result as degraded.
+        """
+        import re
+        from pathlib import Path
+
+        def _env_file_value(path: Path, key: str) -> str:
+            try:
+                for line in path.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+            return ""
+
+        database_url = (
+            os.environ.get("HINDSIGHT_API_DATABASE_URL")
+            or _env_file_value(Path.home() / ".hindsight" / "profiles" / "hermes.env", "HINDSIGHT_API_DATABASE_URL")
+            or _env_file_value(Path.home() / ".hermes" / ".env", "HINDSIGHT_API_DATABASE_URL")
+        )
+        if not database_url:
+            return tool_error("Hindsight recall failed and no database URL is available for text fallback.")
+
+        # psycopg2 accepts postgresql:// URLs directly; keep parsing only for
+        # optional ssl/query cleanup compatibility.
+        terms = [t for t in re.findall(r"[A-Za-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", query) if t]
+        terms = terms[:8] or [query[:80]]
+        like_patterns = [f"%{t}%" for t in terms]
+        bank = self._bank_id or "hindsight"
+
+        try:
+            import psycopg2
+            import psycopg2.extras
+            with psycopg2.connect(database_url) as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        WITH q AS (
+                            SELECT websearch_to_tsquery('english', %s) AS tsq
+                        )
+                        SELECT id::text, bank_id, text, context, memory_type, fact_type, created_at,
+                               ts_rank(search_vector, q.tsq) AS rank,
+                               (
+                                 SELECT count(*) FROM unnest(%s::text[]) AS pat
+                                 WHERE memory_units.text ILIKE pat OR coalesce(memory_units.context,'') ILIKE pat
+                               ) AS term_hits
+                        FROM memory_units, q
+                        WHERE bank_id = %s
+                          AND (
+                            search_vector @@ q.tsq
+                            OR EXISTS (
+                              SELECT 1 FROM unnest(%s::text[]) AS pat
+                              WHERE memory_units.text ILIKE pat OR coalesce(memory_units.context,'') ILIKE pat
+                            )
+                          )
+                        ORDER BY term_hits DESC, rank DESC, created_at DESC
+                        LIMIT %s
+                        """,
+                        (query, like_patterns, bank, like_patterns, limit),
+                    )
+                    rows = cur.fetchall()
+            if not rows and bank != "hindsight":
+                # Last-resort shared bank fallback: many historical imports live
+                # in the global 'hindsight' bank.
+                with psycopg2.connect(database_url) as conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute(
+                            """
+                            SELECT id::text, bank_id, text, context, memory_type, fact_type, created_at,
+                                   0.0 AS rank,
+                                   (
+                                     SELECT count(*) FROM unnest(%s::text[]) AS pat
+                                     WHERE memory_units.text ILIKE pat OR coalesce(memory_units.context,'') ILIKE pat
+                                   ) AS term_hits
+                            FROM memory_units
+                            WHERE bank_id = 'hindsight'
+                              AND EXISTS (
+                                SELECT 1 FROM unnest(%s::text[]) AS pat
+                                WHERE memory_units.text ILIKE pat OR coalesce(memory_units.context,'') ILIKE pat
+                              )
+                            ORDER BY term_hits DESC, created_at DESC
+                            LIMIT %s
+                            """,
+                            (like_patterns, like_patterns, limit),
+                        )
+                        rows = cur.fetchall()
+            if not rows:
+                return json.dumps({"result": "No relevant memories found. (Hindsight text fallback; embedding recall unavailable.)"})
+            lines = []
+            for i, r in enumerate(rows, 1):
+                text = (r.get("text") or "").replace("\n", " ").strip()
+                if len(text) > 700:
+                    text = text[:700] + "..."
+                meta = f"bank={r.get('bank_id')}, type={r.get('memory_type') or r.get('fact_type')}, hits={r.get('term_hits')}"
+                lines.append(f"{i}. [{meta}] {text}")
+            return json.dumps({
+                "result": "Hindsight semantic recall unavailable; used PostgreSQL text fallback.\n" + "\n".join(lines)
+            }, ensure_ascii=False)
+        except Exception as fallback_exc:
+            logger.warning("hindsight text fallback failed: %s", fallback_exc, exc_info=True)
+            return tool_error(f"Hindsight recall failed and text fallback also failed: {fallback_exc}")
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
@@ -1561,6 +1663,13 @@ class HindsightMemoryProvider(MemoryProvider):
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
+                error_text = str(e)
+                if (
+                    "Failed to generate batch embeddings" in error_text
+                    or "AUTHZ_INSUFFICIENT_BALANCE" in error_text
+                    or "Insufficient account balance" in error_text
+                ):
+                    return self._hindsight_text_fallback(query)
                 return tool_error(f"Failed to search memory: {e}")
 
         elif tool_name == "hindsight_reflect":

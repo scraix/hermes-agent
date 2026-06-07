@@ -29,6 +29,18 @@ class _FakeCodexProvider(ImageGenProvider):
             "provider": "codex",
         }
 
+    def edit(self, prompt, image_path, aspect_ratio="landscape", mask_path=None, **kwargs):
+        return {
+            "success": True,
+            "image": "/tmp/codex-edited.png",
+            "model": "gpt-5.2-codex",
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "provider": "codex",
+            "mode": "edit",
+            "input_image": image_path,
+        }
+
 
 class TestPluginDispatch:
     def test_dispatch_routes_to_codex_provider(self, monkeypatch, tmp_path):
@@ -97,3 +109,29 @@ class TestPluginDispatch:
         assert payload["success"] is True
         assert payload["provider"] == "codex"
         assert payload["aspect_ratio"] == "portrait"
+
+
+    def test_image_edit_handler_routes_to_provider_edit(self, monkeypatch, tmp_path):
+        from tools import image_generation_tool
+        from agent import image_gen_registry as registry_module
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        input_path = tmp_path / "input.png"
+        input_path.write_bytes(b"fake")
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: _FakeCodexProvider() if name == "codex" else None)
+
+        payload = json.loads(image_generation_tool._handle_image_edit({
+            "prompt": "clean skin",
+            "image_path": str(input_path),
+            "aspect_ratio": "square",
+        }))
+
+        assert payload["success"] is True
+        assert payload["provider"] == "codex"
+        assert payload["mode"] == "edit"
+        assert payload["image"] == "/tmp/codex-edited.png"
+        assert payload["input_image"] == str(input_path)
+        assert payload["aspect_ratio"] == "square"
